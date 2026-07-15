@@ -34,6 +34,12 @@ use walkdir::WalkDir;
 #[cfg(test)]
 const ALLOWED_PROVIDERS: &[&str] = &["openai", "custom", "codexpilot"];
 
+const AUTOMATIC_BACKUP_LIMIT: usize = 5;
+const MINIMUM_AUTOMATIC_BACKUPS: usize = 2;
+const BACKUP_CAPACITY_LIMIT_BYTES: u64 = 250 * 1024 * 1024;
+const BACKUP_FREE_SPACE_RESERVE_BYTES: u64 = 64 * 1024 * 1024;
+const INCOMPLETE_BACKUP_GRACE: Duration = Duration::from_secs(24 * 60 * 60);
+
 fn canonical_provider(id: &str) -> String {
     source_provider(id)
         .map(|provider| provider.as_str().to_owned())
@@ -108,12 +114,68 @@ pub struct ScanResult {
     pub sources: Vec<SourceSummary>,
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, Default, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum BackupKind {
+    #[default]
+    Automatic,
+    Manual,
+    RestoreSafety,
+}
+
+#[derive(Debug, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct BackupEntry {
+    pub name: String,
+    pub path: String,
+    pub created_at: String,
+    pub size_bytes: u64,
+    pub provider: String,
+    pub kind: BackupKind,
+    pub pinned: bool,
+    pub protected: bool,
+    pub protection_reason: Option<String>,
+    pub restorable: bool,
+    pub status: String,
+    pub manifest_version: Option<u32>,
+}
+
+#[derive(Debug, Serialize, Clone, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct BackupSummary {
+    pub entries: Vec<BackupEntry>,
+    pub restorable_count: usize,
+    pub automatic_count: usize,
+    pub pinned_count: usize,
+    pub legacy_count: usize,
+    pub incomplete_count: usize,
+    pub total_bytes: u64,
+    pub legacy_bytes: u64,
+    pub automatic_limit: usize,
+    pub minimum_automatic: usize,
+    pub capacity_limit_bytes: u64,
+    pub over_limit: bool,
+    pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Serialize, Clone, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct BackupCleanupResult {
+    pub removed_count: usize,
+    pub removed_legacy_count: usize,
+    pub reclaimed_bytes: u64,
+    pub remaining_count: usize,
+    pub remaining_bytes: u64,
+    pub warnings: Vec<String>,
+}
+
 #[derive(Debug, Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct BackupResult {
     pub path: String,
     pub files: Vec<String>,
     pub manifest: String,
+    pub cleanup: Option<BackupCleanupResult>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -160,6 +222,7 @@ pub struct RepairResult {
     pub dry_run: bool,
     pub verified: bool,
     pub backup_path: Option<String>,
+    pub backup_cleanup: Option<BackupCleanupResult>,
     pub plan_token: Option<String>,
     pub lock: String,
     pub needs_admin: bool,
@@ -312,6 +375,7 @@ pub struct DesktopRefreshResult {
     pub blocking_processes: Vec<platform::BlockingProcess>,
     pub selected_sources: Vec<String>,
     pub target_provider: String,
+    pub backup_cleanup: Option<BackupCleanupResult>,
 }
 
 #[allow(dead_code)]
@@ -628,7 +692,7 @@ struct SessionCohorts {
     missing_rollout_ids: HashSet<String>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 struct ManifestFile {
     path: String,
@@ -638,7 +702,7 @@ struct ManifestFile {
     backed_up: bool,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 struct BackupManifest {
     version: u32,
@@ -654,6 +718,10 @@ struct BackupManifest {
     projection_state_sha256: Option<String>,
     #[serde(default)]
     rollout_provider_preimages: Vec<RepairRolloutJournal>,
+    #[serde(default)]
+    kind: BackupKind,
+    #[serde(default)]
+    pinned: bool,
     files: Vec<ManifestFile>,
 }
 
@@ -3236,6 +3304,730 @@ fn ensure_backup_root(home: &Path, create: bool) -> Result<PathBuf, String> {
     Ok(current)
 }
 
+fn backup_directory_size(path: &Path) -> Result<u64, String> {
+    let mut bytes = 0u64;
+    for entry in WalkDir::new(path).follow_links(false) {
+        let entry = entry.map_err(|error| format!("backup traversal failed: {error}"))?;
+        if entry.file_type().is_symlink() {
+            return Err(format!(
+                "backup contains a symlink: {}",
+                entry.path().display()
+            ));
+        }
+        if entry.file_type().is_file() {
+            bytes =
+                bytes.saturating_add(entry.metadata().map_err(|error| error.to_string())?.len());
+        }
+    }
+    Ok(bytes)
+}
+
+fn paths_refer_to_same_file(left: &Path, right: &Path) -> bool {
+    if left == right {
+        return true;
+    }
+    match (fs::canonicalize(left), fs::canonicalize(right)) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => false,
+    }
+}
+
+fn backup_modified_at(path: &Path) -> Option<SystemTime> {
+    fs::symlink_metadata(path)
+        .ok()
+        .and_then(|metadata| metadata.modified().ok())
+}
+
+fn is_ascii_digits(value: &str, length: usize) -> bool {
+    value.len() == length && value.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+fn is_repair_backup_name(name: &str) -> bool {
+    let Some(stamp) = name.strip_prefix("repair-") else {
+        return false;
+    };
+    let mut parts = stamp.split('-');
+    matches!(
+        (parts.next(), parts.next(), parts.next(), parts.next()),
+        (Some(date), Some(time), Some(millis), None)
+            if is_ascii_digits(date, 8)
+                && is_ascii_digits(time, 6)
+                && is_ascii_digits(millis, 3)
+    )
+}
+
+fn is_restore_temporary_name(name: &str) -> bool {
+    name.strip_prefix(".restore-before-")
+        .is_some_and(|stamp| is_ascii_digits(stamp, 17))
+}
+
+fn is_cleanup_quarantine_name(name: &str) -> bool {
+    let Some(remainder) = name.strip_prefix(".deleting-") else {
+        return false;
+    };
+    let mut parts = remainder.rsplitn(3, '-');
+    let (Some(cleanup_stamp), Some(pid), Some(original)) =
+        (parts.next(), parts.next(), parts.next())
+    else {
+        return false;
+    };
+    is_ascii_digits(cleanup_stamp, 17)
+        && !pid.is_empty()
+        && pid.bytes().all(|byte| byte.is_ascii_digit())
+        && (is_repair_backup_name(original) || is_restore_temporary_name(original))
+}
+
+fn is_known_incomplete_backup_name(name: &str) -> bool {
+    is_restore_temporary_name(name) || is_cleanup_quarantine_name(name)
+}
+
+fn backup_created_at(path: &Path, manifest: Option<&BackupManifest>) -> String {
+    if let Some(created_at) = manifest
+        .map(|manifest| manifest.created_at.trim())
+        .filter(|created_at| !created_at.is_empty())
+    {
+        return created_at.to_owned();
+    }
+    backup_modified_at(path)
+        .map(DateTime::<Utc>::from)
+        .map(|created_at| created_at.to_rfc3339())
+        .unwrap_or_default()
+}
+
+fn backup_summary_at(home: &Path) -> Result<BackupSummary, String> {
+    let requested_root = home.join("backups/provider-hub");
+    if !requested_root.exists() {
+        return Ok(BackupSummary {
+            automatic_limit: AUTOMATIC_BACKUP_LIMIT,
+            minimum_automatic: MINIMUM_AUTOMATIC_BACKUPS,
+            capacity_limit_bytes: BACKUP_CAPACITY_LIMIT_BYTES,
+            ..BackupSummary::default()
+        });
+    }
+    let root = ensure_backup_root(home, false)?;
+    let pending = load_pending_operation(home)?;
+    let mut entries = Vec::new();
+    let mut warnings = Vec::new();
+    for item in fs::read_dir(&root).map_err(|error| error.to_string())? {
+        let item = match item {
+            Ok(item) => item,
+            Err(error) => {
+                warnings.push(format!("cannot inspect a backup entry: {error}"));
+                continue;
+            }
+        };
+        let path = item.path();
+        let metadata = match fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                warnings.push(format!(
+                    "cannot inspect backup metadata ({}): {error}",
+                    path.display()
+                ));
+                continue;
+            }
+        };
+        if !metadata.is_dir() || metadata.file_type().is_symlink() {
+            continue;
+        }
+        let name = item.file_name().to_string_lossy().to_string();
+        if !name.starts_with("repair-")
+            && !name.starts_with(".deleting-")
+            && !name.starts_with(".restore-before-")
+        {
+            continue;
+        }
+        let manifest_path = path.join("manifest.json");
+        let manifest_present = match fs::symlink_metadata(&manifest_path) {
+            Ok(_) => true,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+            Err(error) => {
+                warnings.push(format!(
+                    "cannot inspect backup manifest metadata ({}): {error}",
+                    manifest_path.display()
+                ));
+                true
+            }
+        };
+        let manifest = if manifest_present {
+            match fs::read(&manifest_path)
+                .map_err(|error| error.to_string())
+                .and_then(|bytes| {
+                    serde_json::from_slice::<BackupManifest>(&bytes)
+                        .map_err(|error| error.to_string())
+                }) {
+                Ok(manifest) => Some(manifest),
+                Err(error) => {
+                    warnings.push(format!(
+                        "cannot parse backup manifest ({}): {error}",
+                        manifest_path.display()
+                    ));
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let manifest_version = manifest.as_ref().map(|manifest| manifest.version);
+        let mut restorable = is_restorable_backup(&path);
+        let mut status = if restorable {
+            "restorable".to_string()
+        } else if manifest_version.is_some_and(|version| !(4..=6).contains(&version)) {
+            "legacy".to_string()
+        } else if manifest.is_some() || manifest_present || !is_known_incomplete_backup_name(&name)
+        {
+            "corrupt".to_string()
+        } else {
+            "incomplete".to_string()
+        };
+        let protected = pending.as_ref().is_some_and(|pending| {
+            paths_refer_to_same_file(&path, Path::new(&pending.backup_path))
+        });
+        let protection_reason = protected.then(|| "pendingOperation".to_string());
+        let size_bytes = match backup_directory_size(&path) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                warnings.push(error);
+                restorable = false;
+                status = "corrupt".into();
+                0
+            }
+        };
+        entries.push(BackupEntry {
+            name,
+            path: path.to_string_lossy().to_string(),
+            created_at: backup_created_at(&path, manifest.as_ref()),
+            size_bytes,
+            provider: manifest
+                .as_ref()
+                .map(|manifest| manifest.provider.clone())
+                .unwrap_or_default(),
+            kind: manifest
+                .as_ref()
+                .map(|manifest| manifest.kind)
+                .unwrap_or_default(),
+            pinned: manifest.as_ref().is_some_and(|manifest| manifest.pinned),
+            protected,
+            protection_reason,
+            restorable,
+            status,
+            manifest_version,
+        });
+    }
+    entries.sort_by(|left, right| {
+        let left_time = DateTime::parse_from_rfc3339(&left.created_at).ok();
+        let right_time = DateTime::parse_from_rfc3339(&right.created_at).ok();
+        right_time
+            .cmp(&left_time)
+            .then_with(|| right.name.cmp(&left.name))
+    });
+    let total_bytes = entries.iter().map(|entry| entry.size_bytes).sum();
+    let restorable_count = entries.iter().filter(|entry| entry.restorable).count();
+    let automatic_count = entries
+        .iter()
+        .filter(|entry| entry.restorable && !entry.pinned)
+        .count();
+    let pinned_count = entries.iter().filter(|entry| entry.pinned).count();
+    let legacy_count = entries
+        .iter()
+        .filter(|entry| entry.status == "legacy")
+        .count();
+    let incomplete_count = entries
+        .iter()
+        .filter(|entry| matches!(entry.status.as_str(), "incomplete" | "corrupt"))
+        .count();
+    let legacy_bytes = entries
+        .iter()
+        .filter(|entry| entry.status == "legacy")
+        .map(|entry| entry.size_bytes)
+        .sum();
+    let managed_bytes: u64 = entries
+        .iter()
+        .filter(|entry| entry.restorable && !entry.pinned)
+        .map(|entry| entry.size_bytes)
+        .sum();
+    let over_limit = automatic_count > AUTOMATIC_BACKUP_LIMIT
+        || managed_bytes > BACKUP_CAPACITY_LIMIT_BYTES
+        || total_bytes > BACKUP_CAPACITY_LIMIT_BYTES;
+    Ok(BackupSummary {
+        entries,
+        restorable_count,
+        automatic_count,
+        pinned_count,
+        legacy_count,
+        incomplete_count,
+        total_bytes,
+        legacy_bytes,
+        automatic_limit: AUTOMATIC_BACKUP_LIMIT,
+        minimum_automatic: MINIMUM_AUTOMATIC_BACKUPS,
+        capacity_limit_bytes: BACKUP_CAPACITY_LIMIT_BYTES,
+        over_limit,
+        warnings,
+    })
+}
+
+pub fn list_backups_at(home: &Path) -> Result<BackupSummary, String> {
+    let mut summary = backup_summary_at(home)?;
+    for entry in &mut summary.entries {
+        if entry.restorable {
+            if let Err(error) = validate_backup_integrity(home, Path::new(&entry.path)) {
+                entry.restorable = false;
+                entry.status = "corrupt".into();
+                summary.warnings.push(format!(
+                    "backup failed integrity validation ({}): {error}",
+                    entry.path
+                ));
+            }
+        }
+    }
+    summary.restorable_count = summary
+        .entries
+        .iter()
+        .filter(|entry| entry.restorable)
+        .count();
+    summary.automatic_count = summary
+        .entries
+        .iter()
+        .filter(|entry| entry.restorable && !entry.pinned)
+        .count();
+    summary.incomplete_count = summary
+        .entries
+        .iter()
+        .filter(|entry| matches!(entry.status.as_str(), "incomplete" | "corrupt"))
+        .count();
+    let managed_bytes: u64 = summary
+        .entries
+        .iter()
+        .filter(|entry| entry.restorable && !entry.pinned)
+        .map(|entry| entry.size_bytes)
+        .sum();
+    summary.over_limit = summary.automatic_count > AUTOMATIC_BACKUP_LIMIT
+        || managed_bytes > BACKUP_CAPACITY_LIMIT_BYTES
+        || summary.total_bytes > BACKUP_CAPACITY_LIMIT_BYTES;
+    Ok(summary)
+}
+
+pub fn backup_directory_at(home: &Path) -> Result<PathBuf, String> {
+    ensure_backup_root(home, true)
+}
+
+fn validate_backup_child(root: &Path, path: &Path) -> Result<PathBuf, String> {
+    let canonical_root = fs::canonicalize(root).map_err(|error| error.to_string())?;
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|error| format!("backup is unavailable ({}): {error}", path.display()))?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return Err(format!(
+            "backup cleanup refused a non-directory or symlink: {}",
+            path.display()
+        ));
+    }
+    let canonical = fs::canonicalize(path).map_err(|error| error.to_string())?;
+    if canonical.parent() != Some(canonical_root.as_path()) {
+        return Err(format!(
+            "backup cleanup refused a path outside the backup root: {}",
+            path.display()
+        ));
+    }
+    let name = canonical
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| format!("backup name is invalid: {}", path.display()))?;
+    if !name.starts_with("repair-")
+        && !name.starts_with(".deleting-")
+        && !name.starts_with(".restore-before-")
+    {
+        return Err(format!("backup name is not managed by this app: {name}"));
+    }
+    Ok(canonical)
+}
+
+fn remove_backup_directory(root: &Path, path: &Path) -> Result<(), String> {
+    let canonical = validate_backup_child(root, path)?;
+    let name = canonical
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or("backup name is invalid")?;
+    let quarantine = if name.starts_with(".deleting-") {
+        canonical.clone()
+    } else {
+        let quarantine = root.join(format!(
+            ".deleting-{}-{}-{}",
+            name,
+            std::process::id(),
+            Local::now().format("%Y%m%d%H%M%S%3f")
+        ));
+        fs::rename(&canonical, &quarantine).map_err(|error| {
+            format!(
+                "cannot quarantine old backup ({}): {error}",
+                canonical.display()
+            )
+        })?;
+        validate_backup_child(root, &quarantine)?
+    };
+    fs::remove_dir_all(&quarantine).map_err(|error| {
+        format!(
+            "cannot remove old backup ({}): {error}",
+            quarantine.display()
+        )
+    })
+}
+
+fn validate_backup_integrity(home: &Path, path: &Path) -> Result<(), String> {
+    let manifest: BackupManifest = serde_json::from_slice(
+        &fs::read(path.join("manifest.json")).map_err(|error| error.to_string())?,
+    )
+    .map_err(|error| format!("invalid backup manifest: {error}"))?;
+    validate_backup_manifest_version(&manifest)?;
+    if !is_restorable_backup(path) {
+        return Err("backup manifest or required files are incomplete".into());
+    }
+    for file in manifest.files.iter().filter(|file| file.backed_up) {
+        let source = path.join(file.path.replace('/', "_"));
+        let expected = file
+            .sha256
+            .as_deref()
+            .ok_or_else(|| format!("backup checksum is missing: {}", file.path))?;
+        if hash_file(&source).as_deref() != Some(expected) {
+            return Err(format!("backup checksum mismatch: {}", file.path));
+        }
+        if file.path.ends_with(".sqlite") {
+            let connection = open_readonly(&source)?;
+            sqlite_quick_check(&connection)?;
+        } else if file.path == ".codex-global-state.json" {
+            serde_json::from_slice::<Value>(&fs::read(&source).map_err(|error| error.to_string())?)
+                .map_err(|error| format!("invalid global state backup: {error}"))?;
+        }
+    }
+    if manifest.projection_state_present {
+        let source = path.join("projection-state.json");
+        let expected = manifest
+            .projection_state_sha256
+            .as_deref()
+            .ok_or("projection state checksum is missing")?;
+        if hash_file(&source).as_deref() != Some(expected) {
+            return Err("projection state checksum mismatch".into());
+        }
+        serde_json::from_slice::<ProjectionStore>(
+            &fs::read(&source).map_err(|error| error.to_string())?,
+        )
+        .map_err(|error| format!("invalid projection state backup: {error}"))?;
+    }
+    if manifest.version == 6 {
+        let state = open_readonly(&path.join("state_5.sqlite"))?;
+        validate_state_repair_schema(&state)?;
+    } else {
+        validate_repair_schema_files(
+            &path.join("state_5.sqlite"),
+            &path.join("sqlite_codex-dev.db"),
+        )?;
+    }
+    capture_restore_rollout_images(home, &manifest)?;
+    Ok(())
+}
+
+fn incomplete_backup_is_expired(entry: &BackupEntry) -> bool {
+    matches!(entry.status.as_str(), "incomplete")
+        && backup_modified_at(Path::new(&entry.path))
+            .and_then(|modified| modified.elapsed().ok())
+            .is_some_and(|age| age >= INCOMPLETE_BACKUP_GRACE)
+}
+
+fn cleanup_backups_unlocked_with_policy(
+    home: &Path,
+    include_legacy: bool,
+    additionally_protected: &[PathBuf],
+    automatic_limit: usize,
+    minimum_automatic: usize,
+    capacity_limit_bytes: u64,
+) -> Result<BackupCleanupResult, String> {
+    let root = ensure_backup_root(home, true)?;
+    let mut summary = if include_legacy {
+        list_backups_at(home)?
+    } else {
+        backup_summary_at(home)?
+    };
+    let mut result = BackupCleanupResult::default();
+    let is_protected = |entry: &BackupEntry| {
+        entry.protected
+            || additionally_protected
+                .iter()
+                .any(|path| paths_refer_to_same_file(Path::new(&entry.path), path))
+    };
+
+    let explicit_candidates = summary
+        .entries
+        .iter()
+        .filter(|entry| {
+            !entry.pinned
+                && !is_protected(entry)
+                && (incomplete_backup_is_expired(entry)
+                    || (include_legacy && matches!(entry.status.as_str(), "legacy" | "corrupt")))
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    for entry in explicit_candidates {
+        match remove_backup_directory(&root, Path::new(&entry.path)) {
+            Ok(()) => {
+                result.removed_count += 1;
+                result.reclaimed_bytes = result.reclaimed_bytes.saturating_add(entry.size_bytes);
+                if entry.status == "legacy" {
+                    result.removed_legacy_count += 1;
+                }
+            }
+            Err(error) => result.warnings.push(error),
+        }
+    }
+
+    summary = backup_summary_at(home)?;
+    let managed = summary
+        .entries
+        .iter()
+        .filter(|entry| entry.restorable && !entry.pinned)
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut healthy = Vec::new();
+    for entry in managed {
+        match validate_backup_integrity(home, Path::new(&entry.path)) {
+            Ok(()) => healthy.push(entry),
+            Err(error) => {
+                result.warnings.push(format!(
+                    "automatic cleanup retained a damaged backup for explicit review ({}): {error}",
+                    entry.path
+                ));
+            }
+        }
+    }
+    let healthy_bytes: u64 = healthy.iter().map(|entry| entry.size_bytes).sum();
+    let needs_prune = healthy.len() > automatic_limit || healthy_bytes > capacity_limit_bytes;
+    let minimum_keep = healthy
+        .iter()
+        .take(minimum_automatic)
+        .map(|entry| entry.path.clone())
+        .collect::<HashSet<_>>();
+    let mut remaining_count = healthy.len();
+    let mut remaining_bytes = healthy_bytes;
+    if needs_prune {
+        for entry in healthy.iter().rev() {
+            let over_policy =
+                remaining_count > automatic_limit || remaining_bytes > capacity_limit_bytes;
+            if !over_policy || remaining_count <= minimum_automatic {
+                break;
+            }
+            if minimum_keep.contains(&entry.path) || is_protected(entry) {
+                continue;
+            }
+            match remove_backup_directory(&root, Path::new(&entry.path)) {
+                Ok(()) => {
+                    remaining_count -= 1;
+                    remaining_bytes = remaining_bytes.saturating_sub(entry.size_bytes);
+                    result.removed_count += 1;
+                    result.reclaimed_bytes =
+                        result.reclaimed_bytes.saturating_add(entry.size_bytes);
+                }
+                Err(error) => result.warnings.push(error),
+            }
+        }
+    }
+    if remaining_count > automatic_limit || remaining_bytes > capacity_limit_bytes {
+        result.warnings.push(
+            "backup retention remains above its limit because protected restore points could not be removed"
+                .into(),
+        );
+    }
+
+    let remaining = list_backups_at(home)?;
+    for warning in remaining.warnings.iter().cloned() {
+        if !result.warnings.contains(&warning) {
+            result.warnings.push(warning);
+        }
+    }
+    result.remaining_count = remaining.entries.len();
+    result.remaining_bytes = remaining.total_bytes;
+    if remaining.total_bytes > BACKUP_CAPACITY_LIMIT_BYTES
+        && remaining
+            .entries
+            .iter()
+            .any(|entry| entry.pinned || entry.status != "restorable")
+    {
+        result.warnings.push(
+            "backup storage remains above 250 MiB because retained or incompatible backups are excluded from automatic cleanup"
+                .into(),
+        );
+    }
+    Ok(result)
+}
+
+fn cleanup_backups_unlocked(
+    home: &Path,
+    include_legacy: bool,
+    additionally_protected: &[PathBuf],
+) -> Result<BackupCleanupResult, String> {
+    cleanup_backups_unlocked_with_policy(
+        home,
+        include_legacy,
+        additionally_protected,
+        AUTOMATIC_BACKUP_LIMIT,
+        MINIMUM_AUTOMATIC_BACKUPS,
+        BACKUP_CAPACITY_LIMIT_BYTES,
+    )
+}
+
+pub fn cleanup_backups_at(
+    home: &Path,
+    include_legacy: bool,
+) -> Result<BackupCleanupResult, String> {
+    let _guard = platform::acquire_operation_lock(home, "cleanup-backups")?;
+    if let Some(pending) = load_pending_operation(home)? {
+        return Err(format!(
+            "backup cleanup is blocked until incomplete {} is recovered from {}",
+            pending.command, pending.backup_path
+        ));
+    }
+    cleanup_backups_unlocked(home, include_legacy, &[])
+}
+
+fn maintain_backups_at(home: &Path) -> Result<Option<BackupCleanupResult>, String> {
+    if load_pending_operation(home)?.is_some() {
+        return Ok(None);
+    }
+    let summary = backup_summary_at(home)?;
+    let has_expired_incomplete = summary.entries.iter().any(incomplete_backup_is_expired);
+    let managed_bytes: u64 = summary
+        .entries
+        .iter()
+        .filter(|entry| entry.restorable && !entry.pinned)
+        .map(|entry| entry.size_bytes)
+        .sum();
+    if summary.automatic_count <= AUTOMATIC_BACKUP_LIMIT
+        && managed_bytes <= BACKUP_CAPACITY_LIMIT_BYTES
+        && !has_expired_incomplete
+    {
+        return Ok(None);
+    }
+    let _guard = platform::acquire_operation_lock(home, "maintain-backups")?;
+    if load_pending_operation(home)?.is_some() {
+        return Ok(None);
+    }
+    cleanup_backups_unlocked(home, false, &[]).map(Some)
+}
+
+fn estimate_manifest_bytes(home: &Path, rollout_updates: &[RolloutUpdate]) -> Result<u64, String> {
+    let file_rows = relevant_manifest_paths(home)?
+        .into_iter()
+        .fold(0u64, |bytes, path| {
+            let relative_length = path
+                .strip_prefix(home)
+                .unwrap_or(&path)
+                .to_string_lossy()
+                .len() as u64;
+            bytes.saturating_add(relative_length.saturating_add(512))
+        });
+    let rollout_rows = rollout_updates.iter().try_fold(0u64, |bytes, update| {
+        let relative = rollout_relative_path(home, &update.path)?;
+        let provider_length = update
+            .expected_provider
+            .as_deref()
+            .unwrap_or_default()
+            .len()
+            .saturating_add(update.provider.as_deref().unwrap_or_default().len());
+        Ok::<_, String>(
+            bytes.saturating_add(
+                512u64
+                    .saturating_add(update.thread_id.len() as u64)
+                    .saturating_add(relative.len() as u64)
+                    .saturating_add(provider_length as u64),
+            ),
+        )
+    })?;
+    Ok((64 * 1024u64)
+        .saturating_add(file_rows)
+        .saturating_add(rollout_rows))
+}
+
+fn estimate_backup_bytes(home: &Path, rollout_updates: &[RolloutUpdate]) -> Result<u64, String> {
+    let state_path = home.join("state_5.sqlite");
+    let connection = open_readonly(&state_path)?;
+    let page_count: u64 = connection
+        .query_row("PRAGMA page_count", [], |row| row.get(0))
+        .map_err(|error| error.to_string())?;
+    let page_size: u64 = connection
+        .query_row("PRAGMA page_size", [], |row| row.get(0))
+        .map_err(|error| error.to_string())?;
+    let state_bytes = page_count.saturating_mul(page_size);
+    let projection_bytes = fs::metadata(projection_state_path(home))
+        .map(|metadata| metadata.len())
+        .unwrap_or_default();
+    let manifest_bytes = estimate_manifest_bytes(home, rollout_updates)?;
+    let payload = state_bytes
+        .saturating_add(projection_bytes)
+        .saturating_add(manifest_bytes);
+    let margin = (payload / 10).max(8 * 1024 * 1024);
+    Ok(payload.saturating_add(margin))
+}
+
+fn ensure_backup_free_space(
+    home: &Path,
+    rollout_updates: &[RolloutUpdate],
+    available_override: Option<u64>,
+) -> Result<(), String> {
+    let root = ensure_backup_root(home, true)?;
+    let expected = estimate_backup_bytes(home, rollout_updates)?;
+    let required = expected.saturating_add(BACKUP_FREE_SPACE_RESERVE_BYTES);
+    let available = match available_override {
+        Some(available) => available,
+        None => fs2::available_space(&root).map_err(|error| {
+            format!(
+                "cannot inspect backup disk space ({}): {error}",
+                root.display()
+            )
+        })?,
+    };
+    if available < required {
+        return Err(format!(
+            "insufficient disk space for a safe recovery backup: {} MiB available, {} MiB required",
+            available / 1024 / 1024,
+            required / 1024 / 1024
+        ));
+    }
+    Ok(())
+}
+
+pub fn set_backup_pinned_at(
+    home: &Path,
+    requested: &Path,
+    pinned: bool,
+) -> Result<BackupSummary, String> {
+    let _guard = platform::acquire_operation_lock(home, "retain-backup")?;
+    if load_pending_operation(home)?.is_some() {
+        return Err("backup retention cannot change while recovery is pending".into());
+    }
+    let backup = safe_backup_path(home, Some(requested))?;
+    let manifest_path = backup.join("manifest.json");
+    let mut manifest: BackupManifest =
+        serde_json::from_slice(&fs::read(&manifest_path).map_err(|error| error.to_string())?)
+            .map_err(|error| format!("invalid backup manifest: {error}"))?;
+    validate_backup_manifest_version(&manifest)?;
+    manifest.pinned = pinned;
+    let temporary = backup.join(format!(
+        ".manifest-retain-{}-{}.tmp",
+        std::process::id(),
+        Local::now().format("%Y%m%d%H%M%S%3f")
+    ));
+    let result = (|| {
+        let mut file = File::create(&temporary).map_err(|error| error.to_string())?;
+        file.write_all(&serde_json::to_vec_pretty(&manifest).map_err(|error| error.to_string())?)
+            .map_err(|error| error.to_string())?;
+        file.sync_all().map_err(|error| error.to_string())?;
+        drop(file);
+        platform::atomic_replace_file(&temporary, &manifest_path)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result?;
+    backup_summary_at(home)
+}
+
 fn relevant_manifest_paths(home: &Path) -> Result<Vec<PathBuf>, String> {
     let mut paths = Vec::new();
     for relative in [
@@ -3775,6 +4567,45 @@ fn create_backup_snapshot(
     _guarded_global_state: Option<&[u8]>,
     rollout_updates: &[RolloutUpdate],
 ) -> Result<BackupResult, String> {
+    create_backup_snapshot_with_kind(
+        home,
+        _expected_global_state_sha256,
+        _guarded_global_state,
+        rollout_updates,
+        BackupKind::Automatic,
+        false,
+    )
+}
+
+fn create_backup_snapshot_with_kind(
+    home: &Path,
+    _expected_global_state_sha256: Option<&str>,
+    _guarded_global_state: Option<&[u8]>,
+    rollout_updates: &[RolloutUpdate],
+    kind: BackupKind,
+    pinned: bool,
+) -> Result<BackupResult, String> {
+    create_backup_snapshot_with_kind_and_available(
+        home,
+        _expected_global_state_sha256,
+        _guarded_global_state,
+        rollout_updates,
+        kind,
+        pinned,
+        None,
+    )
+}
+
+fn create_backup_snapshot_with_kind_and_available(
+    home: &Path,
+    _expected_global_state_sha256: Option<&str>,
+    _guarded_global_state: Option<&[u8]>,
+    rollout_updates: &[RolloutUpdate],
+    kind: BackupKind,
+    pinned: bool,
+    available_override: Option<u64>,
+) -> Result<BackupResult, String> {
+    ensure_backup_free_space(home, rollout_updates, available_override)?;
     let stamp = Local::now().format("repair-%Y%m%d-%H%M%S-%3f").to_string();
     let destination = ensure_backup_root(home, true)?.join(stamp);
     fs::create_dir(&destination).map_err(|error| error.to_string())?;
@@ -3886,6 +4717,8 @@ fn create_backup_snapshot(
             projection_state_present,
             projection_state_sha256,
             rollout_provider_preimages,
+            kind,
+            pinned,
             files: manifest_files,
         };
         let manifest_path = destination.join("manifest.json");
@@ -3911,6 +4744,7 @@ fn create_backup_snapshot(
                 files
             },
             manifest: manifest_path.to_string_lossy().to_string(),
+            cleanup: None,
         })
     })();
     if result.is_err() {
@@ -3929,17 +4763,27 @@ fn discard_aborted_repair_backup(backup: &BackupResult, reason: &str) -> String 
     }
 }
 
+#[cfg(test)]
 fn create_backup_at_with_rollout_updates(
     home: &Path,
     rollout_updates: &[RolloutUpdate],
 ) -> Result<BackupResult, String> {
+    create_backup_at_with_kind(home, rollout_updates, BackupKind::Automatic, false)
+}
+
+fn create_backup_at_with_kind(
+    home: &Path,
+    rollout_updates: &[RolloutUpdate],
+    kind: BackupKind,
+    pinned: bool,
+) -> Result<BackupResult, String> {
     validate_repair_schema(home)?;
     let _write_fence = acquire_dual_sqlite_write_fence(home, false)?;
-    create_backup_snapshot(home, None, None, rollout_updates)
+    create_backup_snapshot_with_kind(home, None, None, rollout_updates, kind, pinned)
 }
 
 pub fn create_backup_at(home: &Path) -> Result<BackupResult, String> {
-    create_backup_at_with_rollout_updates(home, &[])
+    create_backup_at_with_kind(home, &[], BackupKind::Manual, true)
 }
 
 pub fn create_backup_safe_at(home: &Path) -> Result<BackupResult, String> {
@@ -3971,7 +4815,7 @@ pub fn create_backup_safe_at(home: &Path) -> Result<BackupResult, String> {
     if !blockers.is_empty() {
         return Err("backup aborted because a SQLite owner started after locking".into());
     }
-    let backup = create_backup_at(home)?;
+    let mut backup = create_backup_at(home)?;
     let external_owners = platform::blocking_processes(home)?
         .into_iter()
         .filter(|process| !process.identity.is_current)
@@ -3984,17 +4828,29 @@ pub fn create_backup_safe_at(home: &Path) -> Result<BackupResult, String> {
         })?;
         return Err("backup discarded because a SQLite owner appeared during the snapshot".into());
     }
+    backup.cleanup = Some(
+        cleanup_backups_unlocked(home, false, &[PathBuf::from(&backup.path)]).unwrap_or_else(
+            |error| BackupCleanupResult {
+                warnings: vec![error],
+                ..BackupCleanupResult::default()
+            },
+        ),
+    );
     Ok(backup)
 }
 
 fn latest_backup(home: &Path) -> Option<PathBuf> {
     let root = ensure_backup_root(home, false).ok()?;
-    fs::read_dir(root)
+    let mut candidates = fs::read_dir(root)
         .ok()?
         .filter_map(Result::ok)
         .filter(|entry| is_restorable_backup(&entry.path()))
-        .max_by_key(|entry| entry.file_name())
+        .collect::<Vec<_>>();
+    candidates.sort_by_key(|right| std::cmp::Reverse(right.file_name()));
+    candidates
+        .into_iter()
         .map(|entry| entry.path())
+        .find(|path| validate_backup_integrity(home, path).is_ok())
 }
 
 fn is_restorable_backup(path: &Path) -> bool {
@@ -4062,13 +4918,8 @@ fn safe_backup_path(home: &Path, requested: Option<&Path>) -> Result<PathBuf, St
         Some(value) => home.join(value),
         None => latest_backup(home).ok_or("no backup found")?,
     };
-    let root =
-        fs::canonicalize(ensure_backup_root(home, false)?).map_err(|error| error.to_string())?;
-    let canonical = fs::canonicalize(&path).map_err(|error| error.to_string())?;
-    if !canonical.starts_with(&root) {
-        return Err("backup path is outside CODEX_HOME/backups/provider-hub".into());
-    }
-    Ok(canonical)
+    let root = ensure_backup_root(home, false)?;
+    validate_backup_child(&root, &path)
 }
 
 fn restore_target_is_file(path: &Path) -> Result<bool, String> {
@@ -5064,6 +5915,12 @@ fn finish_failed_online_repair(
 fn restore_backup_operation_at(home: &Path, requested: Option<&Path>) -> Result<(), String> {
     let _guard = platform::acquire_operation_lock(home, "restore")?;
     if let Some(pending) = load_pending_operation(home)? {
+        if requested.is_some() {
+            return Err(format!(
+                "historical restore is blocked while an incomplete {} operation is pending; recover or roll back the pending operation first",
+                pending.command
+            ));
+        }
         if pending.command == "repair" {
             if pending.repair_journal.is_some() {
                 if requested.is_none() {
@@ -5131,8 +5988,14 @@ fn restore_backup_operation_at(home: &Path, requested: Option<&Path>) -> Result<
     )
     .map_err(|error| format!("invalid backup manifest: {error}"))?;
     validate_backup_manifest_version(&target_manifest)?;
+    let _ = cleanup_backups_unlocked(home, false, std::slice::from_ref(&target));
     let safety_rollout_updates = safety_rollout_updates_for_restore(home, &target_manifest)?;
-    let safety = create_backup_at_with_rollout_updates(home, &safety_rollout_updates)?;
+    let safety = create_backup_at_with_kind(
+        home,
+        &safety_rollout_updates,
+        BackupKind::RestoreSafety,
+        false,
+    )?;
     if !platform::blocking_processes(home)?.is_empty() {
         fs::remove_dir_all(&safety.path).map_err(|error| {
             format!(
@@ -5144,7 +6007,11 @@ fn restore_backup_operation_at(home: &Path, requested: Option<&Path>) -> Result<
     save_pending_operation(home, "restore", Path::new(&safety.path))?;
     let result = restore_backup_unchecked(home, Some(&target));
     match result {
-        Ok(()) => clear_pending_operation(home),
+        Ok(()) => {
+            clear_pending_operation(home)?;
+            let _ = cleanup_backups_unlocked(home, false, &[target, PathBuf::from(&safety.path)]);
+            Ok(())
+        }
         Err(error) => {
             let recovery = restore_backup_unchecked(home, Some(Path::new(&safety.path)));
             match recovery {
@@ -6736,6 +7603,7 @@ fn reconcile_pending_repair_on_startup(home: &Path) {
 
 pub fn scan_at(home: &Path) -> Result<ScanResult, String> {
     reconcile_pending_repair_on_startup(home);
+    let _ = maintain_backups_at(home);
     let snapshot = scan_snapshot(home);
     let projection_store = load_projection_store(home)?;
     scan_result_for_snapshot(home, &snapshot, projection_store.as_ref(), None)
@@ -6747,9 +7615,20 @@ pub fn refresh_desktop_at(
     _target_provider: &str,
     _observed_provider: &str,
     scope: ProjectionScope,
-    _initialize: bool,
+    initialize: bool,
 ) -> Result<DesktopRefreshResult, String> {
     reconcile_pending_repair_on_startup(home);
+    let backup_cleanup = if initialize {
+        match maintain_backups_at(home) {
+            Ok(cleanup) => cleanup,
+            Err(error) => Some(BackupCleanupResult {
+                warnings: vec![error],
+                ..BackupCleanupResult::default()
+            }),
+        }
+    } else {
+        None
+    };
     let (snapshot, blocking_processes) = std::thread::scope(|scope| {
         let snapshot = scope.spawn(|| scan_snapshot(home));
         let processes = scope.spawn(|| platform::blocking_processes(home));
@@ -6809,6 +7688,7 @@ pub fn refresh_desktop_at(
         blocking_processes,
         selected_sources,
         target_provider,
+        backup_cleanup,
     })
 }
 
@@ -6964,6 +7844,7 @@ fn repair_projection_selected_at_inner(
             dry_run: true,
             verified: false,
             backup_path: None,
+            backup_cleanup: None,
             plan_token: Some(preview.plan_token),
             lock: inspect_lock(home).state,
             needs_admin: false,
@@ -7002,6 +7883,7 @@ fn repair_projection_selected_at_inner(
             ));
         }
     }
+    let pre_repair_cleanup = cleanup_backups_unlocked(home, false, &[]).ok();
     validate_repair_schema(home)?;
     let config_path = home.join("config.toml");
     let config_fingerprint = hash_file(&config_path).ok_or_else(|| {
@@ -7132,6 +8014,7 @@ fn repair_projection_selected_at_inner(
             dry_run: false,
             verified: verification.ok && !has_reconcile_conflicts && !has_workspace_conflicts,
             backup_path: None,
+            backup_cleanup: pre_repair_cleanup,
             plan_token: Some(applied_plan_token),
             lock: "clear".into(),
             needs_admin: false,
@@ -7393,6 +8276,14 @@ fn repair_projection_selected_at_inner(
             verification.checked,
             verification_total,
         );
+        let backup_cleanup = Some(
+            cleanup_backups_unlocked(home, false, &[PathBuf::from(&backup.path)]).unwrap_or_else(
+                |error| BackupCleanupResult {
+                    warnings: vec![error],
+                    ..BackupCleanupResult::default()
+                },
+            ),
+        );
         Ok(RepairResult {
             changed_threads,
             restored_threads: reconciled.len(),
@@ -7407,6 +8298,7 @@ fn repair_projection_selected_at_inner(
             dry_run: false,
             verified: !has_reconcile_conflicts && !has_workspace_conflicts,
             backup_path: Some(backup.path),
+            backup_cleanup,
             plan_token: Some(applied_plan_token),
             lock: "clear".into(),
             needs_admin: false,
@@ -10654,6 +11546,7 @@ mod tests {
             })
             .expect("restore safety backup must include rollout preimages");
         assert_eq!(safety_manifest.version, 6);
+        assert_eq!(safety_manifest.kind, BackupKind::RestoreSafety);
         assert_eq!(safety_manifest.rollout_provider_preimages.len(), 1);
         assert_eq!(
             safety_manifest.rollout_provider_preimages[0]
@@ -10666,6 +11559,325 @@ mod tests {
                 .after_provider
                 .as_deref(),
             Some("custom")
+        );
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    fn automatic_test_backups(home: &Path, count: usize) -> Vec<PathBuf> {
+        (0..count)
+            .map(|index| {
+                std::thread::sleep(Duration::from_millis(2));
+                let backup = create_backup_snapshot(home, None, None, &[]).unwrap();
+                let path = PathBuf::from(backup.path);
+                let manifest_path = path.join("manifest.json");
+                let mut manifest: BackupManifest =
+                    serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+                manifest.created_at = format!("2026-07-15T00:{index:02}:00+08:00");
+                fs::write(manifest_path, serde_json::to_vec_pretty(&manifest).unwrap()).unwrap();
+                path
+            })
+            .collect()
+    }
+
+    fn set_test_backup_pinned(path: &Path, pinned: bool) {
+        let manifest_path = path.join("manifest.json");
+        let mut manifest: BackupManifest =
+            serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+        manifest.pinned = pinned;
+        fs::write(manifest_path, serde_json::to_vec_pretty(&manifest).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn backup_retention_keeps_the_five_newest_and_is_idempotent() {
+        let home = make_fixture();
+        let backups = automatic_test_backups(&home, 7);
+
+        let cleanup =
+            cleanup_backups_unlocked_with_policy(&home, false, &[], 5, 2, u64::MAX).unwrap();
+        assert_eq!(cleanup.removed_count, 2);
+        assert!(!backups[0].exists());
+        assert!(!backups[1].exists());
+        assert!(backups[2..].iter().all(|path| path.exists()));
+        assert_eq!(backup_summary_at(&home).unwrap().automatic_count, 5);
+
+        let repeated =
+            cleanup_backups_unlocked_with_policy(&home, false, &[], 5, 2, u64::MAX).unwrap();
+        assert_eq!(repeated.removed_count, 0);
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn backup_retention_protects_pending_and_retained_backups() {
+        let home = make_fixture();
+        let backups = automatic_test_backups(&home, 7);
+        set_test_backup_pinned(&backups[0], true);
+        save_pending_operation(&home, "repair", &backups[1]).unwrap();
+
+        let cleanup =
+            cleanup_backups_unlocked_with_policy(&home, false, &[], 5, 2, u64::MAX).unwrap();
+        assert_eq!(cleanup.removed_count, 1);
+        assert!(backups[0].exists());
+        assert!(backups[1].exists());
+        assert!(!backups[2].exists());
+        assert_eq!(backup_summary_at(&home).unwrap().automatic_count, 5);
+
+        clear_pending_operation(&home).unwrap();
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn backup_retention_capacity_never_drops_below_two_healthy_backups() {
+        let home = make_fixture();
+        let backups = automatic_test_backups(&home, 3);
+
+        let cleanup = cleanup_backups_unlocked_with_policy(&home, false, &[], 5, 2, 1).unwrap();
+        assert_eq!(cleanup.removed_count, 1);
+        assert!(!backups[0].exists());
+        assert!(backups[1].exists());
+        assert!(backups[2].exists());
+        assert_eq!(backup_summary_at(&home).unwrap().automatic_count, 2);
+        assert!(cleanup
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("above its limit")));
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn backup_retention_requires_explicit_legacy_cleanup() {
+        let home = make_fixture();
+        let backups = automatic_test_backups(&home, 3);
+        let manifest_path = backups[0].join("manifest.json");
+        let mut manifest: BackupManifest =
+            serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+        manifest.version = 3;
+        fs::write(
+            &manifest_path,
+            serde_json::to_vec_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+
+        let automatic =
+            cleanup_backups_unlocked_with_policy(&home, false, &[], 5, 2, u64::MAX).unwrap();
+        assert_eq!(automatic.removed_legacy_count, 0);
+        assert!(backups[0].exists());
+
+        let explicit =
+            cleanup_backups_unlocked_with_policy(&home, true, &[], 5, 2, u64::MAX).unwrap();
+        assert_eq!(explicit.removed_legacy_count, 1);
+        assert!(!backups[0].exists());
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn backup_retention_reports_damaged_backups_without_silent_pruning() {
+        let home = make_fixture();
+        let backups = automatic_test_backups(&home, 6);
+        fs::write(backups[0].join("state_5.sqlite"), b"damaged").unwrap();
+
+        let cleanup =
+            cleanup_backups_unlocked_with_policy(&home, false, &[], 5, 2, u64::MAX).unwrap();
+        assert_eq!(cleanup.removed_count, 0);
+        assert!(backups[0].exists());
+        assert!(cleanup
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("damaged backup")));
+        let summary = list_backups_at(&home).unwrap();
+        let damaged = summary
+            .entries
+            .iter()
+            .find(|entry| Path::new(&entry.path) == backups[0])
+            .unwrap();
+        assert_eq!(damaged.status, "corrupt");
+        assert!(!damaged.restorable);
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn backup_retention_never_counts_damaged_backups_toward_the_healthy_minimum() {
+        let home = make_fixture();
+        let backups = automatic_test_backups(&home, 6);
+        for backup in &backups[..4] {
+            fs::write(backup.join("state_5.sqlite"), b"damaged").unwrap();
+        }
+
+        let cleanup =
+            cleanup_backups_unlocked_with_policy(&home, false, &[], 5, 2, u64::MAX).unwrap();
+        assert_eq!(cleanup.removed_count, 0);
+        assert!(backups.iter().all(|path| path.exists()));
+        assert_eq!(list_backups_at(&home).unwrap().restorable_count, 2);
+        assert!(
+            cleanup
+                .warnings
+                .iter()
+                .filter(|warning| warning.contains("damaged backup"))
+                .count()
+                >= 4
+        );
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn backup_retention_never_auto_deletes_an_unparseable_manifest() {
+        let home = make_fixture();
+        let backup = automatic_test_backups(&home, 1).remove(0);
+        fs::write(backup.join("manifest.json"), b"{ truncated").unwrap();
+
+        let summary = backup_summary_at(&home).unwrap();
+        let entry = summary
+            .entries
+            .iter()
+            .find(|entry| Path::new(&entry.path) == backup)
+            .unwrap();
+        assert_eq!(entry.status, "corrupt");
+        assert!(!incomplete_backup_is_expired(entry));
+
+        let automatic =
+            cleanup_backups_unlocked_with_policy(&home, false, &[], 5, 2, u64::MAX).unwrap();
+        assert_eq!(automatic.removed_count, 0);
+        assert!(backup.exists());
+
+        let explicit =
+            cleanup_backups_unlocked_with_policy(&home, true, &[], 5, 2, u64::MAX).unwrap();
+        assert_eq!(explicit.removed_count, 1);
+        assert!(!backup.exists());
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn backup_retention_never_auto_deletes_a_final_backup_with_a_missing_manifest() {
+        let home = make_fixture();
+        let backup = automatic_test_backups(&home, 1).remove(0);
+        fs::remove_file(backup.join("manifest.json")).unwrap();
+
+        let summary = backup_summary_at(&home).unwrap();
+        let entry = summary
+            .entries
+            .iter()
+            .find(|entry| Path::new(&entry.path) == backup)
+            .unwrap();
+        assert_eq!(entry.status, "corrupt");
+        assert!(!incomplete_backup_is_expired(entry));
+
+        let cleanup =
+            cleanup_backups_unlocked_with_policy(&home, false, &[], 5, 2, u64::MAX).unwrap();
+        assert_eq!(cleanup.removed_count, 0);
+        assert!(backup.exists());
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn latest_backup_skips_a_newer_snapshot_that_fails_integrity_validation() {
+        let home = make_fixture();
+        let backups = automatic_test_backups(&home, 3);
+        fs::write(backups[2].join("state_5.sqlite"), b"damaged").unwrap();
+
+        let cleanup =
+            cleanup_backups_unlocked_with_policy(&home, false, &[], 5, 2, u64::MAX).unwrap();
+        assert_eq!(cleanup.removed_count, 0);
+        assert_eq!(latest_backup(&home).as_deref(), Some(backups[1].as_path()));
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn schema_incompatible_sqlite_is_not_a_healthy_or_latest_backup() {
+        let home = make_fixture();
+        let backups = automatic_test_backups(&home, 3);
+        let newest = &backups[2];
+        let state_path = newest.join("state_5.sqlite");
+        fs::remove_file(&state_path).unwrap();
+        let incompatible = Connection::open(&state_path).unwrap();
+        incompatible
+            .execute_batch("CREATE TABLE threads (id TEXT PRIMARY KEY);")
+            .unwrap();
+        drop(incompatible);
+
+        let manifest_path = newest.join("manifest.json");
+        let mut manifest: BackupManifest =
+            serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+        let state_entry = manifest
+            .files
+            .iter_mut()
+            .find(|file| file.path == "state_5.sqlite")
+            .unwrap();
+        state_entry.size = fs::metadata(&state_path).unwrap().len();
+        state_entry.sha256 = hash_file(&state_path);
+        fs::write(manifest_path, serde_json::to_vec_pretty(&manifest).unwrap()).unwrap();
+
+        let summary = list_backups_at(&home).unwrap();
+        let incompatible_entry = summary
+            .entries
+            .iter()
+            .find(|entry| Path::new(&entry.path) == newest)
+            .unwrap();
+        assert_eq!(incompatible_entry.status, "corrupt");
+        assert!(!incompatible_entry.restorable);
+
+        let cleanup = cleanup_backups_unlocked_with_policy(&home, false, &[], 5, 2, 1).unwrap();
+        assert_eq!(cleanup.removed_count, 0);
+        assert!(backups.iter().all(|path| path.exists()));
+        assert_eq!(latest_backup(&home).as_deref(), Some(backups[1].as_path()));
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn explicit_historical_restore_is_blocked_until_pending_recovery_finishes() {
+        let home = make_fixture();
+        let backups = automatic_test_backups(&home, 2);
+
+        for command in ["repair", "restore"] {
+            save_pending_operation(&home, command, &backups[0]).unwrap();
+            let error = restore_backup_at(&home, Some(&backups[1])).unwrap_err();
+            assert!(error.contains("historical restore is blocked"), "{error}");
+            let pending = load_pending_operation(&home).unwrap().unwrap();
+            assert_eq!(pending.command, command);
+            assert!(paths_refer_to_same_file(
+                Path::new(&pending.backup_path),
+                &backups[0]
+            ));
+            clear_pending_operation(&home).unwrap();
+        }
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn insufficient_backup_space_is_rejected_before_a_snapshot_directory_is_created() {
+        let home = make_fixture();
+        let result = create_backup_snapshot_with_kind_and_available(
+            &home,
+            None,
+            None,
+            &[],
+            BackupKind::Automatic,
+            false,
+            Some(0),
+        );
+        assert!(result
+            .unwrap_err()
+            .contains("insufficient disk space for a safe recovery backup"));
+        assert!(backup_summary_at(&home).unwrap().entries.is_empty());
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn backup_retention_pins_explicit_backups_by_default() {
+        let home = make_fixture();
+        let backup = create_backup_at(&home).unwrap();
+        let manifest: BackupManifest = serde_json::from_slice(
+            &fs::read(Path::new(&backup.path).join("manifest.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(manifest.kind, BackupKind::Manual);
+        assert!(manifest.pinned);
+        let summary = set_backup_pinned_at(&home, Path::new(&backup.path), false).unwrap();
+        assert!(
+            !summary
+                .entries
+                .iter()
+                .find(|entry| entry.path == backup.path)
+                .unwrap()
+                .pinned
         );
         fs::remove_dir_all(home).unwrap();
     }

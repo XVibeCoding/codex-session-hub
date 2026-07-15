@@ -242,6 +242,30 @@ button:disabled { cursor: not-allowed; opacity: .48; }
 .section-title-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
 .section-title-row h3 { margin: 0; }
 .path-value { margin: 12px 0 0; overflow-wrap: anywhere; color: #536b64; font-family: Consolas, "Microsoft YaHei UI", monospace; font-size: 14px; line-height: 1.55; }
+.backup-toolbar, .backup-row-actions, .backup-footer-actions { display: flex; align-items: center; gap: 7px; }
+.backup-overview { min-height: 44px; display: flex; align-items: center; justify-content: space-between; gap: 14px; margin-top: 13px; border-top: 1px solid #e5ece9; border-bottom: 1px solid #e5ece9; color: #4e6961; font-size: 14px; }
+.backup-overview > span:first-child { display: flex; align-items: center; gap: 8px; }
+.backup-overview strong { color: #1f584a; font-size: 18px; font-variant-numeric: tabular-nums; }
+.backup-policy { margin: 11px 0 0; color: #60766f; font-size: 13px; line-height: 1.55; }
+.backup-latest-action { margin-top: 12px; }
+.backup-history { margin-top: 14px; border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); }
+.backup-history > summary { min-height: 44px; display: flex; align-items: center; justify-content: space-between; gap: 12px; cursor: pointer; color: #31574d; font-size: 14px; font-weight: 700; list-style-position: inside; }
+.backup-history > summary span { color: var(--muted); font-variant-numeric: tabular-nums; font-weight: 600; }
+.backup-history-list { border-top: 1px solid #e5ece9; }
+.backup-row { min-height: 92px; display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 14px; padding: 12px 0; border-top: 1px solid #edf1ef; }
+.backup-row:first-child { border-top: 0; }
+.backup-row-main { min-width: 0; display: grid; gap: 4px; }
+.backup-row-main strong { color: #294d44; font-size: 14px; line-height: 1.35; }
+.backup-row-main span { color: #637971; font-size: 13px; line-height: 1.4; }
+.backup-row-main small { overflow: hidden; color: #85958f; font-family: Consolas, "Microsoft YaHei UI", monospace; font-size: 12px; line-height: 1.4; text-overflow: ellipsis; white-space: nowrap; }
+.backup-row-actions { justify-content: flex-end; flex-wrap: wrap; }
+.backup-status { padding: 3px 7px; border: 1px solid #cbd9d4; border-radius: 4px; color: #4d6b62; background: #f6f9f8; font-size: 12px; font-style: normal; line-height: 1.25; white-space: nowrap; }
+.backup-status.legacy, .backup-status.corrupt, .backup-status.incomplete { border-color: #e3c7b4; color: #8a4f25; background: #fff8f2; }
+.backup-restore-button { min-width: 68px; justify-content: center; }
+.backup-empty { margin: 0; padding: 20px 0; color: var(--faint); font-size: 14px; }
+.backup-warning { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 12px; margin-top: 13px; padding: 11px 0; border-bottom: 1px solid #ead9cc; color: #795337; font-size: 13px; line-height: 1.5; }
+.backup-read-warning { margin: 11px 0 0; color: #8a4f25; font-size: 13px; line-height: 1.5; }
+.backup-footer-actions { justify-content: flex-end; margin-top: 12px; }
 .log-section { padding-bottom: 0; }
 .technical-logs { max-height: 360px; margin: 14px -24px 0; overflow-y: auto; border-top: 1px solid var(--line); background: #fcfdfc; }
 .technical-log { min-height: 52px; display: grid; grid-template-columns: 78px minmax(0, 1fr); gap: 12px; align-items: start; padding: 13px 24px; border-bottom: 1px solid #e8eeeb; font-size: 14px; line-height: 1.5; }
@@ -287,6 +311,8 @@ button:disabled { cursor: not-allowed; opacity: .48; }
   .drawer-header { min-height: 82px; flex-basis: 82px; }
   .detail-section { padding-top: 16px; padding-bottom: 16px; }
   .detail-list > div { min-height: 38px; }
+  .backup-row { grid-template-columns: 1fr; gap: 8px; }
+  .backup-row-actions { justify-content: flex-start; }
   .technical-log { min-height: 46px; padding-top: 10px; padding-bottom: 10px; }
 }
 

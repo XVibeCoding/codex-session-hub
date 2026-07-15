@@ -91,6 +91,49 @@ export type DesktopRefresh = {
   blockingProcesses: BlockingProcess[]
   selectedSources: string[]
   targetProvider: string
+  backupCleanup?: BackupCleanupResult
+}
+
+export type BackupKind = 'automatic' | 'manual' | 'restoreSafety'
+
+export type BackupEntry = {
+  name: string
+  path: string
+  createdAt: string
+  sizeBytes: number
+  provider: string
+  kind: BackupKind
+  pinned: boolean
+  protected: boolean
+  protectionReason?: string
+  restorable: boolean
+  status: 'restorable' | 'legacy' | 'corrupt' | 'incomplete'
+  manifestVersion?: number
+}
+
+export type BackupSummary = {
+  entries: BackupEntry[]
+  restorableCount: number
+  automaticCount: number
+  pinnedCount: number
+  legacyCount: number
+  incompleteCount: number
+  totalBytes: number
+  legacyBytes: number
+  automaticLimit: number
+  minimumAutomatic: number
+  capacityLimitBytes: number
+  overLimit: boolean
+  warnings: string[]
+}
+
+export type BackupCleanupResult = {
+  removedCount: number
+  removedLegacyCount: number
+  reclaimedBytes: number
+  remainingCount: number
+  remainingBytes: number
+  warnings: string[]
 }
 
 export type RepairResult = {
@@ -104,6 +147,7 @@ export type RepairResult = {
   skipped: number
   verified: boolean
   backupPath?: string
+  backupCleanup?: BackupCleanupResult
 }
 
 export type VerifyResult = {

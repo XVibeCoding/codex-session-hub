@@ -24,6 +24,9 @@ import {
   X,
 } from 'lucide-react'
 import type {
+  BackupCleanupResult,
+  BackupEntry,
+  BackupSummary,
   BlockingProcess,
   CloseResult,
   DesktopRefresh,
@@ -95,6 +98,11 @@ function createLog(tone: LogEntry['tone'], text: string): LogEntry {
   }
 }
 
+function formatStorage(bytes: number) {
+  if (bytes < 1024 * 1024) return `${Math.max(0, bytes / 1024).toFixed(1)} KB`
+  return `${(bytes / 1024 / 1024).toFixed(1)} MB`
+}
+
 function groupSessions(sessions: LocalSession[]): SessionGroup[] {
   const groups = new Map<string, SessionGroup>()
   for (const session of sessions) {
@@ -156,6 +164,9 @@ function errorMessage(error: unknown) {
   if (/administrator|permission|access is denied/i.test(message)) {
     return 'Windows 拒绝了本次操作。通常先关闭相关 Codex 实例即可，不建议默认以管理员身份运行。'
   }
+  if (/insufficient disk space for a safe recovery backup/i.test(message)) {
+    return '系统盘剩余空间不足，无法先创建安全回滚点。工具尚未写入任何会话数据，请释放部分空间后重试。'
+  }
   return message
 }
 
@@ -184,12 +195,46 @@ export default function App() {
   const [recoveryLockConflict, setRecoveryLockConflict] = useState(false)
   const [restartPath, setRestartPath] = useState<string | null>(null)
   const [technicalOpen, setTechnicalOpen] = useState(false)
+  const [backups, setBackups] = useState<BackupSummary | null>(null)
+  const [backupLoading, setBackupLoading] = useState(false)
+  const [backupActionPath, setBackupActionPath] = useState<string | null>(null)
   const [updateOpen, setUpdateOpen] = useState(false)
   const updater = useAppUpdater(appVersion)
 
   const addLog = useCallback((tone: LogEntry['tone'], text: string) => {
     setLogs(current => [createLog(tone, text), ...current].slice(0, 100))
   }, [])
+
+  const logBackupCleanup = useCallback((cleanup?: BackupCleanupResult) => {
+    if (!cleanup) return
+    if (cleanup.removedCount > 0) {
+      addLog(
+        'ok',
+        `已自动整理 ${cleanup.removedCount} 个旧备份，释放 ${formatStorage(cleanup.reclaimedBytes)}，当前保留 ${cleanup.remainingCount} 个备份。`,
+      )
+    }
+    for (const warning of cleanup.warnings) {
+      addLog('warn', `备份整理提示：${warning}`)
+    }
+  }, [addLog])
+
+  const refreshBackups = useCallback(async () => {
+    if (!isTauriDesktop()) return null
+    setBackupLoading(true)
+    try {
+      const summary = await call<BackupSummary>('list_backups')
+      setBackups(summary)
+      for (const warning of summary.warnings) {
+        addLog('warn', `备份读取提示：${warning}`)
+      }
+      return summary
+    } catch (error) {
+      addLog('warn', `读取备份列表失败：${errorMessage(error)}`)
+      return null
+    } finally {
+      setBackupLoading(false)
+    }
+  }, [addLog])
 
   useEffect(() => {
     localStorage.setItem(LOG_STORAGE_KEY, JSON.stringify(logs))
@@ -227,6 +272,7 @@ export default function App() {
         'ok',
         `扫描完成：发现 ${result.localSessions.length} 个本地会话，已排除 ${result.scan.remoteExcludedSessions} 个明确远端会话。`,
       )
+      logBackupCleanup(result.backupCleanup)
       return result
     } catch (error) {
       const message = errorMessage(error)
@@ -236,7 +282,7 @@ export default function App() {
     } finally {
       setScanning(false)
     }
-  }, [addLog, desktop])
+  }, [addLog, desktop, logBackupCleanup])
 
   useEffect(() => {
     if (!isTauriDesktop()) {
@@ -245,6 +291,11 @@ export default function App() {
     }
     void refreshDesktop(true).catch(() => undefined)
   }, [])
+
+  useEffect(() => {
+    if (!technicalOpen || backups) return
+    void refreshBackups()
+  }, [backups, refreshBackups, technicalOpen])
 
   const sessions = desktop?.localSessions ?? []
   const filteredSessions = useMemo(() => {
@@ -363,6 +414,8 @@ export default function App() {
       onProgress,
     })
     setRepairResult(result)
+    setBackups(null)
+    logBackupCleanup(result.backupCleanup)
 
     setRecoveryPhase('refreshing')
     try {
@@ -381,7 +434,7 @@ export default function App() {
       setToast('已恢复可安全处理的会话')
       addLog('warn', `在线恢复已提交；${result.skipped} 个记录因冲突或边界规则被安全跳过。`)
     }
-  }, [addLog, recoveryRange, refreshDesktop, selectedThreadIds])
+  }, [addLog, logBackupCleanup, recoveryRange, refreshDesktop, selectedThreadIds])
 
   const startRecovery = useCallback(async () => {
     if (!desktop) return
@@ -439,6 +492,97 @@ export default function App() {
     }
   }, [addLog, closeBlockingProcesses, desktop, performRecovery, refreshDesktop])
 
+  const cleanupBackups = useCallback(async (includeLegacy: boolean) => {
+    if (includeLegacy) {
+      const confirmed = window.confirm(
+        '旧版与损坏备份无法由当前版本恢复，删除后不可撤销。manifest 已损坏的备份可能无法识别原锁定状态；正常且可校验的锁定备份和正在使用的备份不会被删除。\n\n是否继续清理？',
+      )
+      if (!confirmed) return
+    }
+    setBackupLoading(true)
+    try {
+      const cleanup = await call<BackupCleanupResult>('cleanup_backups', { includeLegacy })
+      logBackupCleanup(cleanup)
+      if (cleanup.removedCount === 0 && cleanup.warnings.length === 0) {
+        addLog('info', '备份已经符合保留策略，无需清理。')
+      }
+      await refreshBackups()
+      setToast(cleanup.removedCount > 0 ? '旧备份已清理' : '备份无需清理')
+    } catch (error) {
+      const message = errorMessage(error)
+      addLog('warn', `清理备份失败：${message}`)
+      setToast('备份清理未完成')
+    } finally {
+      setBackupLoading(false)
+    }
+  }, [addLog, logBackupCleanup, refreshBackups])
+
+  const retainBackup = useCallback(async (entry: BackupEntry) => {
+    setBackupActionPath(entry.path)
+    try {
+      const summary = await call<BackupSummary>('set_backup_retained', {
+        backupPath: entry.path,
+        retained: !entry.pinned,
+      })
+      setBackups(summary)
+      addLog(
+        'ok',
+        entry.pinned
+          ? `备份已恢复自动管理：${entry.name}`
+          : `备份已锁定保留：${entry.name}`,
+      )
+    } catch (error) {
+      addLog('warn', `修改备份保留状态失败：${errorMessage(error)}`)
+    } finally {
+      setBackupActionPath(null)
+    }
+  }, [addLog])
+
+  const openBackupFolder = useCallback(async () => {
+    try {
+      await call('open_backup_folder')
+    } catch (error) {
+      addLog('warn', `打开备份目录失败：${errorMessage(error)}`)
+    }
+  }, [addLog])
+
+  const restoreBackup = useCallback(async (entry: BackupEntry) => {
+    if (!entry.restorable || entry.protected) return
+    setBackupActionPath(entry.path)
+    try {
+      const current = await refreshDesktop(false)
+      if (current.scan.pendingOperation) {
+        setToast('请先处理未完成的恢复')
+        addLog('warn', '检测到尚未收尾的修复或恢复操作，请先完成安全回滚或刷新收尾，再选择历史备份。')
+        return
+      }
+      if (current.blockingProcesses.length > 0) {
+        setToast('历史回滚前请先关闭 Codex')
+        addLog('warn', '恢复历史备份前请先保存工作并关闭正在占用会话数据库的 Codex 程序。')
+        return
+      }
+      const time = new Date(entry.createdAt).toLocaleString('zh-CN', { hour12: false })
+      const confirmed = window.confirm(
+        `将恢复 ${time} 的会话索引快照${entry.provider ? `（Provider：${entry.provider}）` : ''}。执行前会自动备份当前状态。\n\n请确认已关闭 Codex，是否继续？`,
+      )
+      if (!confirmed) return
+      setRecoveryPhase('rollingBack')
+      await call<VerifyResult>('restore_backup', { backupPath: entry.path })
+      await refreshDesktop(false)
+      await refreshBackups()
+      setRecoveryPhase('idle')
+      setToast('历史备份已恢复')
+      addLog('ok', `已恢复历史备份：${entry.name}。恢复前状态也已保留为安全快照。`)
+    } catch (error) {
+      const message = errorMessage(error)
+      setRecoveryError(message)
+      setRecoveryPhase('error')
+      addLog('warn', `历史备份恢复失败：${message}`)
+    } finally {
+      setBackupActionPath(null)
+    }
+  }, [addLog, refreshBackups, refreshDesktop])
+
   const rollback = useCallback(async () => {
     const pendingRepair = desktop?.scan.pendingOperation?.command === 'repair'
     if (!pendingRepair && !desktop?.scan.lastBackup) return
@@ -454,6 +598,7 @@ export default function App() {
         setRecoveryPhase('rollingBack')
         await call<VerifyResult>('rollback_latest')
         await refreshDesktop(false)
+        setBackups(null)
         setRecoveryOpen(false)
         setRecoveryPhase('idle')
         setToast('未完成修复已安全回滚')
@@ -478,6 +623,7 @@ export default function App() {
       setRecoveryPhase('rollingBack')
       await call<VerifyResult>('rollback_latest')
       await refreshDesktop(false)
+      setBackups(null)
       setRecoveryOpen(false)
       setRecoveryPhase('idle')
       setToast('已回滚最近一次恢复')
@@ -764,9 +910,17 @@ export default function App() {
         localSessionCount={sessions.length}
         processes={desktop?.blockingProcesses ?? []}
         logs={logs}
-        busy={recoveryPhase === 'rollingBack'}
+        backups={backups}
+        backupLoading={backupLoading}
+        backupActionPath={backupActionPath}
+        busy={recoveryPhase === 'rollingBack' || backupLoading || Boolean(backupActionPath)}
         onClose={() => setTechnicalOpen(false)}
         onRollback={() => void rollback()}
+        onRefreshBackups={() => void refreshBackups()}
+        onOpenBackupFolder={() => void openBackupFolder()}
+        onCleanupBackups={includeLegacy => void cleanupBackups(includeLegacy)}
+        onRetainBackup={entry => void retainBackup(entry)}
+        onRestoreBackup={entry => void restoreBackup(entry)}
         onClearLogs={() => setLogs([])}
       />
 

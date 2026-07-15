@@ -2,13 +2,12 @@ import {
   CheckCircle2,
   CircleAlert,
   Database,
-  FileClock,
-  RotateCcw,
   Terminal,
   Trash2,
   X,
 } from 'lucide-react'
-import type { BlockingProcess, LogEntry, Scan } from '../app-types'
+import type { BackupEntry, BackupSummary, BlockingProcess, LogEntry, Scan } from '../app-types'
+import { BackupManagerSection } from './BackupManagerSection'
 
 type TechnicalDrawerProps = {
   open: boolean
@@ -16,9 +15,17 @@ type TechnicalDrawerProps = {
   localSessionCount: number
   processes: BlockingProcess[]
   logs: LogEntry[]
+  backups: BackupSummary | null
+  backupLoading: boolean
+  backupActionPath: string | null
   busy: boolean
   onClose: () => void
   onRollback: () => void
+  onRefreshBackups: () => void
+  onOpenBackupFolder: () => void
+  onCleanupBackups: (includeLegacy: boolean) => void
+  onRetainBackup: (entry: BackupEntry) => void
+  onRestoreBackup: (entry: BackupEntry) => void
   onClearLogs: () => void
 }
 
@@ -28,9 +35,17 @@ export function TechnicalDrawer({
   localSessionCount,
   processes,
   logs,
+  backups,
+  backupLoading,
+  backupActionPath,
   busy,
   onClose,
   onRollback,
+  onRefreshBackups,
+  onOpenBackupFolder,
+  onCleanupBackups,
+  onRetainBackup,
+  onRestoreBackup,
   onClearLogs,
 }: TechnicalDrawerProps) {
   if (!open) return null
@@ -47,7 +62,6 @@ export function TechnicalDrawer({
           ? `检测到未收尾的 ${scan.pendingOperation.command} 操作。请保留现场并刷新。`
           : null
   const rollbackLabel = pendingRepair ? '安全回滚未完成修复' : '离线回滚最近一次'
-  const rollbackPath = pendingRepair ? scan?.pendingOperation?.backupPath : scan?.lastBackup
   const stateSource = scan?.sources.find(source => source.name === 'threads')
   const catalogSource = scan?.sources.find(source => source.name === 'local_thread_catalog')
 
@@ -97,15 +111,21 @@ export function TechnicalDrawer({
             ) : null}
           </section>
 
-          <section className="detail-section">
-            <div className="section-title-row">
-              <h3><FileClock size={16} />备份与回滚</h3>
-              <button className="text-button danger" type="button" onClick={onRollback} disabled={(!scan?.lastBackup && !pendingRepair) || busy}>
-                <RotateCcw size={14} />{rollbackLabel}
-              </button>
-            </div>
-            <p className="path-value" title={rollbackPath}>{rollbackPath ?? '尚未创建修复备份'}</p>
-          </section>
+          <BackupManagerSection
+            summary={backups}
+            loading={backupLoading}
+            busy={busy}
+            actionPath={backupActionPath}
+            rollbackDisabled={!scan?.lastBackup && !pendingRepair}
+            historicalRestoreDisabled={Boolean(scan?.pendingOperation)}
+            rollbackLabel={rollbackLabel}
+            onRollbackLatest={onRollback}
+            onRefresh={onRefreshBackups}
+            onOpenFolder={onOpenBackupFolder}
+            onCleanup={onCleanupBackups}
+            onRetain={onRetainBackup}
+            onRestore={onRestoreBackup}
+          />
 
           <section className="detail-section log-section">
             <div className="section-title-row">

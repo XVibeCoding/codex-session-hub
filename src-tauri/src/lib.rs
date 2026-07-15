@@ -4,8 +4,8 @@ pub mod projection;
 pub mod rollout;
 
 use core::{
-    BackupResult, DesktopRefreshResult, ProjectionPreviewResult, RepairProgress, RepairResult,
-    ScanResult, VerifyResult,
+    BackupCleanupResult, BackupResult, BackupSummary, DesktopRefreshResult,
+    ProjectionPreviewResult, RepairProgress, RepairResult, ScanResult, VerifyResult,
 };
 use platform::{BlockingProcess, CloseProcessResult, ProcessIdentity};
 use projection::ProjectionScope;
@@ -49,6 +49,40 @@ async fn create_backup() -> Result<BackupResult, String> {
     tauri::async_runtime::spawn_blocking(|| core::create_backup_safe_at(&home()))
         .await
         .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+async fn list_backups() -> Result<BackupSummary, String> {
+    tauri::async_runtime::spawn_blocking(|| core::list_backups_at(&home()))
+        .await
+        .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+async fn cleanup_backups(include_legacy: bool) -> Result<BackupCleanupResult, String> {
+    tauri::async_runtime::spawn_blocking(move || core::cleanup_backups_at(&home(), include_legacy))
+        .await
+        .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+async fn set_backup_retained(backup_path: String, retained: bool) -> Result<BackupSummary, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        core::set_backup_pinned_at(&home(), std::path::Path::new(&backup_path), retained)
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+async fn open_backup_folder() -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(|| {
+        let codex_home = home();
+        let path = core::backup_directory_at(&codex_home)?;
+        platform::open_folder(&path)
+    })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 #[tauri::command]
@@ -212,6 +246,10 @@ pub fn run() {
             scan_codex,
             refresh_desktop,
             create_backup,
+            list_backups,
+            cleanup_backups,
+            set_backup_retained,
+            open_backup_folder,
             preview_projection,
             repair_indexes,
             verify_codex,
