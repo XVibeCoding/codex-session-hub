@@ -16,66 +16,47 @@ export type AppUpdateProgress = {
   percent: number | null
 }
 
+export type AppUpdateLogger = (tone: 'info' | 'ok' | 'warn', message: string) => void
+
 const EMPTY_PROGRESS: AppUpdateProgress = {
   downloaded: 0,
   total: null,
   percent: null,
 }
 
-const LATEST_MANIFEST_URL = 'https://github.com/XVibeCoding/codex-provider-hub/releases/latest/download/latest.json'
-
-type LatestManifest = {
-  version: string | null
-  notes: string | null
-}
+const UPDATE_CHECK_TIMEOUT_MS = 10_000
+const UPDATE_CHECK_RETRY_DELAY_MS = 800
 
 function normalizeVersion(version: string) {
   return version.trim().replace(/^v/i, '')
 }
 
-function compareVersions(left: string, right: string) {
-  const leftParts = normalizeVersion(left).split(/[.+-]/)
-  const rightParts = normalizeVersion(right).split(/[.+-]/)
-  const length = Math.max(leftParts.length, rightParts.length)
-
-  for (let index = 0; index < length; index += 1) {
-    const leftPart = leftParts[index] ?? '0'
-    const rightPart = rightParts[index] ?? '0'
-    const leftNumber = Number(leftPart)
-    const rightNumber = Number(rightPart)
-
-    if (Number.isFinite(leftNumber) && Number.isFinite(rightNumber)) {
-      if (leftNumber !== rightNumber) return leftNumber - rightNumber
-      continue
-    }
-
-    const compared = leftPart.localeCompare(rightPart)
-    if (compared !== 0) return compared
-  }
-
-  return 0
+function wait(milliseconds: number) {
+  return new Promise<void>(resolve => window.setTimeout(resolve, milliseconds))
 }
 
-async function fetchLatestManifest(): Promise<LatestManifest | null> {
-  const response = await fetch(`${LATEST_MANIFEST_URL}?t=${Date.now()}`, {
-    cache: 'no-store',
-  })
-  if (!response.ok) return null
+function formatElapsed(startedAt: number) {
+  return `${((Date.now() - startedAt) / 1000).toFixed(1)} 秒`
+}
 
-  const payload = await response.json() as {
-    version?: unknown
-    notes?: unknown
-  }
-  return {
-    version: typeof payload.version === 'string' ? normalizeVersion(payload.version) : null,
-    notes: typeof payload.notes === 'string' ? payload.notes.trim() || null : null,
-  }
+function rawUpdateError(error: unknown) {
+  return String(error).replace(/^Error:\s*/i, '').trim()
+}
+
+function diagnosticUpdateError(error: unknown) {
+  const message = rawUpdateError(error)
+    .replace(/[A-Z]:\\Users\\[^\\\s]+/gi, '<user-home>')
+    .replace(/\s+/g, ' ')
+  return (message || 'unknown updater error').slice(0, 320)
 }
 
 function readableUpdateError(error: unknown) {
-  const message = String(error).replace(/^Error:\s*/i, '')
+  const message = rawUpdateError(error)
   if (/404|not found|valid release json|release json|latest\.json/i.test(message)) {
     return '未读取到在线更新清单 latest.json。请稍后重试，或到项目 Releases 页面手动下载安装包。'
+  }
+  if (/json|deserialize|parse|invalid response|invalid data/i.test(message)) {
+    return '在线更新清单格式异常，请稍后重试，或到项目 Releases 页面手动下载安装包。'
   }
   if (/timed?\s*out|network|connection|dns|request|fetch/i.test(message)) {
     return '暂时无法连接更新服务器，请检查网络后重试。'
@@ -86,53 +67,86 @@ function readableUpdateError(error: unknown) {
   return message || '检查更新失败，请稍后重试。'
 }
 
-export function useAppUpdater(currentVersion?: string | null) {
+export function useAppUpdater(onLog?: AppUpdateLogger) {
   const updateRef = useRef<Update | null>(null)
+  const checkInFlightRef = useRef<Promise<void> | null>(null)
   const [status, setStatus] = useState<AppUpdateStatus>('idle')
   const [latestVersion, setLatestVersion] = useState<string | null>(null)
   const [releaseNotes, setReleaseNotes] = useState<string | null>(null)
   const [progress, setProgress] = useState<AppUpdateProgress>(EMPTY_PROGRESS)
   const [error, setError] = useState<string | null>(null)
 
-  const checkForUpdates = useCallback(async () => {
-    if (status === 'checking' || status === 'downloading' || status === 'installing') return
-    setStatus('checking')
-    setError(null)
-    setProgress(EMPTY_PROGRESS)
-    try {
-      if (updateRef.current) {
-        await updateRef.current.close().catch(() => undefined)
-        updateRef.current = null
-      }
-      const manifest = await fetchLatestManifest().catch(() => null)
-      if (manifest) {
-        setLatestVersion(manifest.version)
-        setReleaseNotes(manifest.notes)
-      }
+  const checkForUpdates = useCallback(() => {
+    if (checkInFlightRef.current) return checkInFlightRef.current
+    if (status === 'downloading' || status === 'installing') return Promise.resolve()
 
-      const { check } = await import('@tauri-apps/plugin-updater')
-      const update = await check({ timeout: 15_000 })
-      if (!update) {
-        setStatus('upToDate')
-        return
+    const operation = (async () => {
+      const startedAt = Date.now()
+      setStatus('checking')
+      setError(null)
+      setLatestVersion(null)
+      setReleaseNotes(null)
+      setProgress(EMPTY_PROGRESS)
+      onLog?.('info', '开始检查应用更新：正在连接 GitHub Releases。')
+
+      try {
+        if (updateRef.current) {
+          await updateRef.current.close().catch(() => undefined)
+          updateRef.current = null
+        }
+
+        const { check } = await import('@tauri-apps/plugin-updater')
+        let update: Update | null = null
+        let lastError: unknown
+
+        for (let attempt = 0; attempt < 2; attempt += 1) {
+          const attemptStartedAt = Date.now()
+          try {
+            update = await check({ timeout: UPDATE_CHECK_TIMEOUT_MS })
+            lastError = undefined
+            break
+          } catch (caught) {
+            lastError = caught
+            if (attempt === 0) {
+              onLog?.(
+                'info',
+                `首次更新检查未完成（${formatElapsed(attemptStartedAt)}），稍后自动重试一次。诊断：${diagnosticUpdateError(caught)}`,
+              )
+              await wait(UPDATE_CHECK_RETRY_DELAY_MS)
+            }
+          }
+        }
+
+        if (lastError) throw lastError
+        if (!update) {
+          setStatus('upToDate')
+          onLog?.('ok', `应用更新检查完成（${formatElapsed(startedAt)}）：当前已是最新版。`)
+          return
+        }
+
+        updateRef.current = update
+        const version = normalizeVersion(update.version)
+        setLatestVersion(version)
+        setReleaseNotes(update.body?.trim() || null)
+        setStatus('available')
+        onLog?.('ok', `应用更新检查完成（${formatElapsed(startedAt)}）：发现新版本 v${version}。`)
+      } catch (caught) {
+        const message = readableUpdateError(caught)
+        setError(message)
+        setStatus('error')
+        onLog?.(
+          'warn',
+          `应用更新检查失败（${formatElapsed(startedAt)}）：${message} 诊断：${diagnosticUpdateError(caught)}`,
+        )
       }
-      updateRef.current = update
-      setLatestVersion(normalizeVersion(update.version))
-      setReleaseNotes(update.body?.trim() || manifest?.notes || null)
-      setStatus('available')
-    } catch (caught) {
-      const manifest = await fetchLatestManifest().catch(() => null)
-      const installedVersion = currentVersion && currentVersion !== '未知' ? currentVersion : null
-      if (manifest?.version && installedVersion && compareVersions(manifest.version, installedVersion) <= 0) {
-        setLatestVersion(manifest.version)
-        setReleaseNotes(manifest.notes)
-        setStatus('upToDate')
-        return
-      }
-      setError(readableUpdateError(caught))
-      setStatus('error')
-    }
-  }, [currentVersion, status])
+    })()
+
+    checkInFlightRef.current = operation
+    void operation.finally(() => {
+      if (checkInFlightRef.current === operation) checkInFlightRef.current = null
+    })
+    return operation
+  }, [onLog, status])
 
   const installUpdate = useCallback(async () => {
     const update = updateRef.current
@@ -148,8 +162,9 @@ export function useAppUpdater(currentVersion?: string | null) {
     setError(null)
     setProgress(EMPTY_PROGRESS)
     setStatus('downloading')
+    onLog?.('info', `开始下载应用更新 v${normalizeVersion(update.version)}。`)
     try {
-      await update.downloadAndInstall(event => {
+      await update.download(event => {
         if (event.event === 'Started') {
           downloaded = 0
           total = event.data.contentLength ?? null
@@ -163,17 +178,22 @@ export function useAppUpdater(currentVersion?: string | null) {
           return
         }
         setProgress(current => ({ ...current, percent: 100 }))
-        setStatus('installing')
       }, { timeout: 5 * 60_000 })
 
+      setProgress(current => ({ ...current, percent: 100 }))
       setStatus('installing')
+      onLog?.('ok', `应用更新 v${normalizeVersion(update.version)} 下载完成且签名校验通过，正在启动系统安装程序。`)
+      await update.install()
+
       const { relaunch } = await import('@tauri-apps/plugin-process')
       await relaunch()
     } catch (caught) {
-      setError(readableUpdateError(caught))
+      const message = readableUpdateError(caught)
+      setError(message)
       setStatus('error')
+      onLog?.('warn', `应用更新安装失败：${message}`)
     }
-  }, [status])
+  }, [onLog, status])
 
   return {
     status,

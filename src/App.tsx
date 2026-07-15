@@ -199,11 +199,11 @@ export default function App() {
   const [backupLoading, setBackupLoading] = useState(false)
   const [backupActionPath, setBackupActionPath] = useState<string | null>(null)
   const [updateOpen, setUpdateOpen] = useState(false)
-  const updater = useAppUpdater(appVersion)
 
   const addLog = useCallback((tone: LogEntry['tone'], text: string) => {
     setLogs(current => [createLog(tone, text), ...current].slice(0, 100))
   }, [])
+  const updater = useAppUpdater(addLog)
 
   const logBackupCleanup = useCallback((cleanup?: BackupCleanupResult) => {
     if (!cleanup) return

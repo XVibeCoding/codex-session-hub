@@ -10,7 +10,7 @@ use core::{
 use platform::{BlockingProcess, CloseProcessResult, ProcessIdentity};
 use projection::ProjectionScope;
 use std::path::PathBuf;
-use tauri::ipc::Channel;
+use tauri::{ipc::Channel, Manager};
 
 fn home() -> PathBuf {
     core::default_codex_home()
@@ -233,7 +233,18 @@ async fn reveal_rollout_file(path: String) -> Result<String, String> {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tauri::Builder::default()
+    let builder = tauri::Builder::default();
+
+    #[cfg(desktop)]
+    let builder = builder.plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+        if let Some(window) = app.get_webview_window("main") {
+            let _ = window.unminimize();
+            let _ = window.show();
+            let _ = window.set_focus();
+        }
+    }));
+
+    builder
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_opener::init())
         .setup(|app| {

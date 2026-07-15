@@ -59,12 +59,11 @@ export function AppUpdateDialog({
   }, [onCheck, open, status])
 
   if (!open) return null
-  const busy = status === 'checking' || status === 'downloading' || status === 'installing'
+  const transferBusy = status === 'downloading' || status === 'installing'
   const percentLabel = progress.percent === null ? null : `${progress.percent}%`
-  const remoteVersionText = latestVersion ? `远端最新 v${latestVersion}` : '正在读取远端版本'
 
   return (
-    <div className="dialog-backdrop" role="presentation" onMouseDown={busy ? undefined : onClose}>
+    <div className="dialog-backdrop" role="presentation" onMouseDown={transferBusy ? undefined : onClose}>
       <section
         className="update-dialog"
         role="dialog"
@@ -78,7 +77,7 @@ export function AppUpdateDialog({
             <h2 id="update-title">应用更新</h2>
             <p>当前版本 <strong>v{currentVersion}</strong>，更新包由项目签名验证后安装。</p>
           </div>
-          <button className="icon-button" type="button" aria-label="关闭" onClick={onClose} disabled={busy}>
+          <button className="icon-button" type="button" aria-label="关闭" onClick={onClose} disabled={transferBusy}>
             <X size={18} />
           </button>
         </header>
@@ -88,7 +87,7 @@ export function AppUpdateDialog({
             <div className="update-state">
               <LoaderCircle className="spin" size={30} />
               <h3>正在检查新版本</h3>
-              <p>正在读取项目的正式发布信息。</p>
+              <p>正在连接 GitHub Releases，连接失败时会自动重试一次。</p>
             </div>
           ) : status === 'available' ? (
             <div className="update-state available">
@@ -119,7 +118,7 @@ export function AppUpdateDialog({
             <div className="update-state">
               <span className="update-state-icon success"><CheckCircle2 size={25} /></span>
               <h3>当前已是最新版本</h3>
-              <p>已安装 v{currentVersion}，{latestVersion ? `${remoteVersionText}，没有比当前更高的可安装版本。` : '暂时没有可用更新。'}</p>
+              <p>已成功检查 GitHub Releases。已安装 v{currentVersion}，当前没有更高版本。</p>
               <div className="update-actions">
                 <button className="secondary-button" type="button" onClick={onCheck}><RefreshCw size={16} />重新检查</button>
                 <button className="secondary-button" type="button" onClick={() => void openExternal(RELEASES_URL)}><ExternalLink size={16} />查看 Releases</button>
