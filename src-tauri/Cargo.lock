@@ -348,6 +348,7 @@ dependencies = [
  "tauri-build",
  "toml 0.8.2",
  "walkdir",
+ "windows",
 ]
 
 [[package]]

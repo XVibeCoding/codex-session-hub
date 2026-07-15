@@ -1,296 +1,332 @@
 # Codex Provider Hub
 
-Codex Provider Hub 是一个基于 Tauri 2、Rust 和 React 的本地桌面工具。它用于修复 Codex 切换 Provider 后出现的会话可见性问题，不负责管理 Provider 密钥或模型配置。
+Codex Provider Hub 是一款基于 Tauri 2、Rust 和 React/TypeScript 的本地桌面工具，用于修复 Codex 切换 Provider 后历史会话仍在磁盘上、却不再出现在侧栏的问题。
 
-工具默认只读。执行修复前会先创建两套 SQLite 的可回滚快照，随后只更新可信的本地会话状态和侧栏索引。rollout JSONL、`session_index.jsonl`、凭据和 Provider 配置不会被改写。
+工具只处理本机数据，不管理 Provider 密钥或模型，不连接远端主机，也不会上传会话内容。
 
 ## 解决什么问题
 
-切换 OpenAI、Custom 或 CodexPilot 后，历史会话可能还在磁盘上，却不再出现在 Codex 侧栏。常见原因不是 JSONL 丢失，而是几层本地状态没有对齐：
+切换 Provider 后，Codex 当前使用的 <code>config.toml.model_provider</code> 可能与历史会话记录的 Provider 不一致。会话文件并没有丢失，但 Codex 会按 Provider 过滤本地线程，于是旧会话看起来像“消失了”。
 
-- `config.toml` 只记录当前根级 `model_provider`。
-- `state_5.sqlite / threads` 仍保留会话原来的 Provider、归档和来源信息。
-- `sqlite/codex-dev.db / local_thread_catalog` 决定本机侧栏是否有对应索引。
-- rollout JSONL 中的 `session_meta` 可能保留旧 Provider；本工具只读取它，不修改它。
+Codex Provider Hub 会：
 
-Codex Provider Hub 会按 thread ID 合并这些来源，先预览差异，再备份、同步和验证。修复成功表示本地状态和侧栏索引已经对齐，不表示上游侧栏会一次展示全部历史记录。Codex 自身仍可能只展示最近一部分会话。
+1. 自动发现 <code>CODEX_HOME</code> 和当前 Provider。
+2. 从活动与归档 rollout 中列出全部有效本地会话。
+3. 允许恢复全部会话，或只恢复用户勾选的会话。
+4. 在写入前自动备份。
+5. 将目标会话对齐到当前 Provider，并立即验证结果。
+6. 保留会话原有的归档、内部线程和来源语义。
+
+它不会创建 <code>codex_local_session</code> 之类的中间 Provider。无论当前 Provider 是 <code>openai</code>、<code>custom</code> 还是此前从未见过的合法 ID，工具都读取并精确使用根级 <code>model_provider</code>。切换到另一个 Provider 后，再运行一次修复即可。
 
 ## 快速使用
 
-### 桌面端
+1. 双击 <code>codex-provider-hub.exe</code>，或从安装包启动 Codex Provider Hub。
+2. 等待自动扫描完成。首页直接显示全部有效本地会话，不按原 Provider 隐藏。
+3. 不勾选会话时，主按钮为“恢复全部会话”；勾选一条或多条后，主按钮变为“恢复选中的 N 个会话”。
+4. 点击恢复并确认当前目标 Provider。
+5. 工具自动完成预览、备份、短事务写入和验证。
+6. 返回 Codex 查看会话。若侧栏仍显示旧缓存，再重启 Codex。
 
-1. 启动安装版或 `codex-provider-hub.exe`。
-2. 等待工具自动发现并扫描 `CODEX_HOME`。
-3. 查看可恢复会话、侧栏覆盖、待恢复和远端映射数量。
-4. 选择目标 Provider，先保留“预览模式”。
-5. 检查变更数、跳过原因、权限和进程锁状态。
-6. 准备写入时，先退出 Codex、Codex++、Provider launcher 及相关进程。
-7. 关闭预览模式，执行同步。写入目标必须与 `config.toml` 当前 Provider 一致。
-8. 同步后执行验证。需要撤销时，使用“回滚最近一次”。
+默认不需要关闭 Codex。只有真正发生 SQLite 写冲突并在重试后仍未释放时，界面才会提示关闭占用程序。普通的“检测到 Codex 正在运行”不是错误，也不是修复前置条件。
 
-实际写入前会自动创建 SQLite 快照。界面的“创建 SQLite 快照”用于额外手动保护，不是执行修复的前置步骤。重复执行已经完成的修复应返回 `0 changes`，也不会创建无意义的新备份。
+### 两种恢复范围
 
-### CLI
+- 恢复全部会话：处理扫描到的全部有效本地 rollout。
+- 恢复选中的会话：只处理列表中明确勾选的 thread ID。
 
-桌面程序和 CLI 是两个独立入口。双击 `codex-provider-hub.exe` 只打开桌面窗口，不会附带控制台；自动化脚本使用 `codex-provider-hub-cli.exe`：
+本项目不再提供“最近 50 条”修复范围。修复范围只有“全部”或“选定”；Codex 侧栏最终展示多少条，仍由 Codex 自身的界面策略决定。
 
-```powershell
+### 哪些会话会出现
+
+默认包含：
+
+- <code>sessions/</code> 下的活动会话；
+- <code>archived_sessions/</code> 下的归档会话；
+- 普通用户会话；
+- 子代理、自动化等本机内部会话。
+
+修复不会把归档会话变为活动会话，也不会把内部会话改成普通用户会话。工具只对齐可见性所需的状态。
+
+默认排除：
+
+- 元数据明确标记为 SSH、WSL、Dev Container、Codespaces 或其他远端主机的会话；
+- 缺少有效 <code>session_meta</code> 的损坏 rollout；
+- thread ID 重复或文件名与 ID 冲突、无法安全确定唯一来源的记录。
+
+<code>source=vscode</code> 本身不代表远端。只有结构化的远端强信号才会触发排除。
+
+## 数据来源
+
+这些文件不是几套可以相加的“会话总数”，而是同一批 thread ID 的不同状态层：
+
+| 数据源 | 用途 | 修复时是否写入 |
+| --- | --- | --- |
+| <code>sessions/**/*.jsonl</code> | 活动 rollout，会话全集来源之一 | 只更新首条 <code>session_meta</code> 中的 Provider 元数据 |
+| <code>archived_sessions/**/*.jsonl</code> | 归档 rollout，会话全集来源之一 | 只更新首条 <code>session_meta</code> 中的 Provider 元数据 |
+| <code>state_5.sqlite / threads</code> | Codex 官方线程状态，权威修复数据库 | 是，按 thread ID 精确更新或补建必要字段 |
+| <code>sqlite/codex-dev.db / local_thread_catalog</code> | 本地侧栏缓存/投影 | 否，仅用于诊断覆盖情况 |
+| <code>session_index.jsonl</code> | 可能滞后的辅助索引 | 否，仅用于诊断 |
+| <code>config.toml</code> | 提供当前根级 <code>model_provider</code> | 否，只读 |
+| <code>auth.json</code> | 凭据 | 否，不读取密钥、不修改 |
+
+### 总会话数的口径
+
+会话总数以 <code>sessions/</code> 和 <code>archived_sessions/</code> 中可读取、ID 唯一、具有有效 <code>session_meta</code> 的本地 rollout 为准，再排除明确远端记录。
+
+<code>session_index.jsonl</code> 可能不完整，不能当作总数。<code>local_thread_catalog</code> 可能缺行或滞后，也不能当作总数。缺少 catalog 数据不会阻止扫描、恢复或验证，catalog 数据库不存在也不是修复失败。
+
+### 为什么能看到两套 SQLite
+
+<code>state_5.sqlite</code> 是 Codex 的官方线程状态库，也是本工具的实际修复目标。
+
+<code>sqlite/codex-dev.db</code> 中的 <code>local_thread_catalog</code> 是辅助缓存。工具会读取它解释“为何侧栏当前覆盖不完整”，但正常修复不再依赖它，也不会为了恢复会话去改写它。因此，本工具不是“双 SQLite 同步器”。
+
+## 修复流程
+
+~~~text
+扫描本地 rollout
+  -> 按 thread ID 建立全部本地会话清单
+  -> 读取 config.toml 当前 Provider
+  -> 生成全部或选定会话的预览计划
+  -> 获取 Provider Hub 操作锁
+  -> 重新扫描并校验 planToken
+  -> 在线备份 state_5.sqlite 与 rollout Provider 前镜像
+  -> 短事务写入
+  -> 重新扫描并验证
+  -> 返回结果与日志
+~~~
+
+目标 Provider 必须与执行时 <code>config.toml</code> 根级 <code>model_provider</code> 精确一致。工具不使用固定 Provider 白名单，也不要求目标 ID 已出现在历史会话中。Provider 在预览与写入之间发生变化时，旧计划会被拒绝，不会误写到另一个 Provider。
+
+### 实际写入内容
+
+对恢复范围内的会话，工具只写入可见性所需内容：
+
+- <code>state_5.sqlite / threads</code> 中的 Provider、rollout 路径及必要线程元数据；
+- rollout 首条 <code>session_meta</code> 中的 Provider 字段；
+- 工具自身用于安全恢复的内部状态。
+
+会话消息、标题正文、后续 JSONL 记录、Provider 配置、密钥和模型配置不会被批量重写。归档状态和内部线程类型保持原样。
+
+## 安全、备份与回滚
+
+### 只读预览和计划令牌
+
+扫描、预览和验证都是只读操作。每次 apply 都必须携带刚刚预览生成的 <code>planToken</code>。如果当前 Provider、数据库、rollout 或选择范围在预览后发生变化，工具会拒绝旧令牌并要求重新预览。
+
+### 自动备份
+
+真正写入前会在下列目录创建备份：
+
+~~~text
+CODEX_HOME/backups/provider-hub/
+~~~
+
+当前备份包含：
+
+- <code>state_5.sqlite</code> 的一致性快照；
+- 本次将修改的 rollout Provider 前镜像；
+- 存在时的工具内部投影状态；
+- 带校验信息的 <code>manifest.json</code>。
+
+备份不复制整份会话消息，因此不会因为大量 JSONL 内容造成无意义的备份膨胀。
+
+### 失败处理
+
+- 写入前或提交前失败时，工具不会留下半完成结果，并会按记录进行安全补偿。
+- 提交后验证失败时，工具保留操作记录和备份，不会在 Codex 可能已经写入新数据后盲目整库覆盖。
+- 用户可以从技术信息区域显式恢复最近备份或指定备份。
+
+整库恢复属于应急操作。执行恢复前应先关闭实际占用数据库的程序，避免覆盖恢复期间的新写入。
+
+### 幂等
+
+同一 Provider、同一范围重复执行修复时，第二次应返回 <code>0 changes</code>。这既是正常结果，也是判断修复是否稳定的重要验证。
+
+### 操作锁
+
+Provider Hub 使用 Windows 原生文件锁防止两个修复任务同时写入。磁盘上存在 <code>.lck</code> 文件不代表锁仍被占用；只要没有进程持有 OS 锁，状态就是可用。不要手动删除锁文件。
+
+## 验证代表什么
+
+修复后的验证会重新读取本地数据，并检查：
+
+- 目标 thread ID 仍有唯一、有效的本地 rollout；
+- <code>state_5.sqlite</code> 中的 Provider 已与当前 <code>model_provider</code> 对齐；
+- rollout 首条 Provider 元数据已对齐；
+- rollout 路径、归档状态和内部线程语义符合修复计划；
+- 选定修复没有误改未选中的会话。
+
+验证通过表示本地会话状态已完成对齐，不等于 Codex UI 必须在同一分组中一次渲染全部历史。遇到侧栏缓存时，重启 Codex 后再检查。
+
+## CLI
+
+桌面 GUI 与 CLI 是两个入口。Windows 下双击 GUI 不会打开控制台窗口；自动化脚本使用 <code>codex-provider-hub-cli.exe</code>。
+
+~~~powershell
 codex-provider-hub-cli.exe scan
-codex-provider-hub-cli.exe repair
-codex-provider-hub-cli.exe repair --apply
+codex-provider-hub-cli.exe backup
+$preview = codex-provider-hub-cli.exe repair --dry-run | ConvertFrom-Json
+codex-provider-hub-cli.exe repair --apply --plan-token $preview.planToken
 codex-provider-hub-cli.exe verify
 codex-provider-hub-cli.exe restore
-```
+~~~
 
-常用参数：
+完整语法：
 
-```powershell
-codex-provider-hub-cli.exe scan --codex-home C:\Users\me\.codex
-codex-provider-hub-cli.exe repair --target-provider openai --dry-run
-codex-provider-hub-cli.exe repair --target-provider openai --apply
-codex-provider-hub-cli.exe verify --target-provider openai
-codex-provider-hub-cli.exe restore backups\provider-hub\repair-20260713-120000-000
-```
+~~~text
+codex-provider-hub-cli.exe scan
+  [--codex-home PATH]
 
-- `repair` 默认是 dry-run，只有 `--apply` 或 `--write` 才允许写入 SQLite。
-- `--target-provider` 省略时读取 `config.toml` 的当前 Provider。
-- `--codex-home` 省略时先读取 `CODEX_HOME` 环境变量，再使用 `%USERPROFILE%\.codex` 或 `$HOME/.codex`。
-- `restore` 的备份路径必须位于 `CODEX_HOME/backups/provider-hub` 内。
-- 成功结果以 JSON 写到 stdout，错误写到 stderr。成功退出码为 `0`，失败为 `1`。
+codex-provider-hub-cli.exe backup
+  [--codex-home PATH]
 
-## 数据来源和指标口径
+codex-provider-hub-cli.exe repair
+  [--codex-home PATH]
+  [--target-provider ID]
+  [--plan-token TOKEN]
+  [--dry-run|--apply]
 
-这里没有一个文件可以单独代表“全部有效会话”。工具按 ID 合并来源，再用同一批 ID 计算覆盖率。
+codex-provider-hub-cli.exe verify
+  [--codex-home PATH]
+  [--target-provider ID]
 
-| 数据源 | 用途 | 写入策略 |
-| --- | --- | --- |
-| `state_5.sqlite / threads` | 线程登记、Provider、归档、来源和角色 | 仅更新通过安全筛选的普通本地线程 |
-| `sessions/**/*.jsonl` | 活动会话内容和 `session_meta` | 只读 |
-| `archived_sessions/**/*.jsonl` | 已归档会话内容 | 只读，默认不参与修复 |
-| `sqlite/codex-dev.db / local_thread_catalog` | 本机及远端侧栏映射 | 只修改安全的 `host_id=local` 行 |
-| `session_index.jsonl` | 辅助快速索引，可能滞后或不完整 | 只读诊断，不作为总量 |
-| `.codex-global-state.json` | UI 和线程状态辅助信息 | 只读诊断 |
+codex-provider-hub-cli.exe restore [BACKUP_PATH]
+  [--codex-home PATH]
+~~~
 
-核心集合可以简化为：
+CLI 的 <code>repair</code> 当前处理全部会话；选定会话请使用桌面端。CLI 不支持 <code>--scope</code>，也没有“最近 50 条”模式。
 
-```text
-普通候选 T = 活动、可信 Provider、普通用户 threads
-有效内容 R = sessions 中 ID 唯一、可读取且不含歧义的 rollout
-本地索引 L = 非 missing_candidate 的本地 catalog
-远端映射 N = 非本机 host 或带明确 SSH/WSL/容器标记的记录
-可恢复 E   = (T ∩ R) - 远端排除项
+规则：
 
-侧栏覆盖率       = |E ∩ L| / |E|
-session index覆盖 = |E ∩ session_index| / |E|，仅用于诊断
-待恢复数量       = |E - L|
-```
-
-界面指标含义：
-
-- `state` 是 `threads` 的唯一 ID 总数，包含归档、自动化和其他跳过项。
-- `普通候选` 是经过 Provider、来源、角色和归档筛选后的活动线程。
-- `可恢复会话` 还要求存在唯一且可读取的活动 rollout，并排除远端线程。
-- `侧栏覆盖` 的分子和分母都来自可恢复集合，不会用 local catalog 总数除以 session index 总数。
-- `远端映射` 是 catalog host 或来源元数据明确标记为远端的唯一 ID。
-- `孤儿` 存在于本地索引、rollout 或 session index，但没有可信 `threads` 行。已识别的远端映射不算本地孤儿。
-- `内容异常` 表示普通本地候选缺少唯一、无歧义的活动 rollout。
-- `待恢复` 是可恢复集合中缺少本地 catalog 的 ID 数量。
-- `Provider 漂移` 是同一可恢复 ID 在 state 与本地 catalog 中的 Provider 不一致。
-- `JSONL Provider 漂移` 只作提示。工具不改 JSONL，因此修复后它仍可能存在。
-
-## VS Code 和远端会话
-
-`source=vscode` 只说明会话由 VS Code 入口创建，不能据此判断它来自本机、SSH、WSL 还是 Dev Container。
-
-工具只使用强信号识别远端：
-
-- catalog 的 `host_id` 不是 `local`；
-- `source_kind` 或 `source_detail` 明确表示 remote、SSH、WSL、Dev Container 或 Codespaces；
-- thread 来源元数据包含明确的远端 authority。
-
-只有 remote catalog、没有安全本地映射的线程会被排除，不会被补成 `host_id=local`。同一 ID 同时存在 local 和 remote 行时，只检查 local 行，remote 行保持原样。工具不会连接 SSH 主机，也不会扫描远端机器上的 `~/.codex`。
-
-Linux 风格 `cwd` 本身不是远端证据。这样可以避免把本机 WSL 路径、容器挂载目录或普通 VS Code 会话误判成远端。
+- <code>repair</code> 默认为 dry-run。
+- 只有 <code>--apply</code> 或 <code>--write</code> 才会写入。
+- apply 必须带上前一次 dry-run 返回的 <code>planToken</code>。
+- 省略 <code>--target-provider</code> 时读取当前 <code>config.toml.model_provider</code>；显式传入时也必须与当前值一致。
+- 省略 <code>--codex-home</code> 时依次使用 <code>CODEX_HOME</code>、Windows 的 <code>%USERPROFILE%\.codex</code> 或 Unix 的 <code>$HOME/.codex</code>。
+- <code>restore</code> 省略路径时恢复最近的完整备份。
+- 成功结果以 JSON 写入 stdout，错误写入 stderr；成功退出码为 0，失败为 1。
 
 ## 能力边界
 
 当前支持：
 
-- 自动发现 `CODEX_HOME`，也可通过 CLI 指定路径。
-- 扫描两套 SQLite、活动和归档 rollout、session index、global state。
-- OpenAI、Custom、CodexPilot Provider allowlist。
-- 普通 `cli`、`vscode`、`appServer`、`custom` 和 `user` 来源。
-- dry-run、SQLite 快照、Provider 对齐、本地 catalog 增补、验证和回滚。
-- 跳过远端、归档、子代理、自动化、未知来源、不可信 Provider 和内容异常记录。
-- 幂等修复。第二次执行应显示 `0 changes`。
+- 自动发现本机 <code>CODEX_HOME</code>；
+- 扫描全部有效本地活动、归档和内部 rollout；
+- 动态识别任意合法 Provider ID；
+- 恢复全部会话或桌面端选定会话；
+- Provider 精确匹配、预览令牌、自动备份、验证和回滚；
+- Codex 保持运行时的在线修复；
+- 标题与项目名模糊搜索；
+- 打开项目目录、定位 rollout 文件和复制会话 ID；
+- 本地操作日志和技术诊断。
 
 当前不做：
 
-- Provider 密钥、模型、`config.toml` 或 `auth.json` 管理。
-- JSONL、`session_index.jsonl` 或 global state 重写。
-- 找回已经丢失的会话内容。
-- 云同步、后台 watcher、自动连接远端主机。
-- 强制关闭 Codex 进程或盲目删除锁文件。
-- 自动处理子代理、自动化、exec 或未知来源。
-- 绕过 Codex 上游侧栏的显示数量限制。
-- 完整复制整个 `CODEX_HOME`。
-- 持久化执行日志。桌面日志只存在于当前应用会话，CLI 日志由 stdout/stderr 输出。
-
-## 安全设计
-
-| 操作 | 是否修改会话数据 |
-| --- | --- |
-| 扫描 | 否 |
-| dry-run | 否 |
-| 验证 | 否 |
-| 创建快照 | 不改业务库；写入备份目录和工具锁 |
-| apply | 修改两套 SQLite 中经过筛选的字段和本地索引 |
-| restore | 用快照恢复两套 SQLite |
-
-写入前会执行以下检查：
-
-- 两套 SQLite 位于 `CODEX_HOME` 内，是普通文件且不是符号链接。
-- schema 包含修复所需的表和字段。
-- SQLite `quick_check` 通过。
-- 没有活动 Codex、Codex++ 或 launcher 进程。
-- 工具锁可获取，数据库可以取得写锁。
-- 目标 Provider 位于 allowlist，且与 `config.toml` 当前 Provider 一致。
-- 写入计划只包含本地、活动、普通且具有有效 rollout 的线程。
-
-备份目录：
-
-```text
-CODEX_HOME/backups/provider-hub/repair-YYYYMMDD-HHMMSS-mmm/
-```
-
-每次备份实际复制：
-
-```text
-state_5.sqlite
-sqlite/codex-dev.db
-```
-
-manifest 会记录这两份快照的 SHA-256、SQLite user version，以及 config、auth、global state 和 JSONL 的路径、大小、修改时间。后面这些文件只登记资产信息，不复制内容。因此这是“两库 SQLite 快照 + 资产清单”，不是完整的 `CODEX_HOME` 灾备。
-
-修复后会重新扫描并验证。写入失败或验证失败时，工具会尝试恢复刚创建的快照；如果恢复也失败，错误会明确报告。失效工具锁会被改名留存，不会直接删除。
+- Provider 密钥、模型或 <code>config.toml</code> 管理；
+- 自动切换 Provider；
+- SSH、WSL、Dev Container 或其他远端会话修复；
+- 云同步或后台常驻 watcher；
+- 会话消息内容迁移；
+- 强制绕过 Codex 自身的侧栏显示上限或缓存策略。
 
 ## 排障
 
-### `CODEX_HOME` 未发现
+### 扫描或恢复提示 SQLite busy
 
-确认目录存在。桌面端使用 `CODEX_HOME` 环境变量或当前用户的 `~/.codex`；CLI 可以显式指定：
+先直接重试。Codex 的写事务通常很短，正常情况下不必关闭它。持续失败时，再保存当前工作并使用界面提供的关闭占用程序功能。
 
-```powershell
-codex-provider-hub.exe scan --codex-home C:\Users\me\.codex
-```
+只有关闭动作明确返回 <code>Access denied</code>，并确认占用进程以更高权限运行时，才需要以管理员身份启动 Provider Hub。
 
-### `SQLite` 少于 2 个或 schema 不支持
+### Provider 不匹配
 
-确认下面两个文件存在，并由当前 Codex 版本正常创建：
+先确认 <code>config.toml</code> 根级 <code>model_provider</code> 是你当前实际使用的 Provider，再重新扫描。Provider ID 区分大小写并按原值处理；工具不会回退到 OpenAI，也不会自动选择历史来源 Provider。
 
-```text
-CODEX_HOME/state_5.sqlite
-CODEX_HOME/sqlite/codex-dev.db
-```
+### 计划已过期
 
-不要手工创建空数据库。检查当前用户是否有读取权限。
+重新扫描并预览，然后使用新返回的 <code>planToken</code>。这表示预览后 Provider、会话选择或本地数据发生了变化，属于安全保护。
 
-### `process-active`
+### catalog 或 session index 数量较少
 
-日志会列出检测到的进程。保存正在进行的工作，正常退出 Codex、Codex++ 和 Provider launcher，然后重新扫描。工具不会代替用户结束进程。
+这是允许的。它们只是诊断来源，不是会话全集，也不是修复前置条件。请以有效本地 rollout 列表为准。
 
-### 活动锁或数据库锁
+### 修复成功但 Codex 侧栏尚未刷新
 
-先确认锁的 owner PID 是否仍在运行。不要直接删除 `.provider-hub.lock` 或 SQLite 的 `-wal/-shm` 文件。退出相关应用后重试；持续出现 `database is locked or not writable` 时，再检查文件权限和进程权限级别。
+先重启 Codex 以清除侧栏缓存。若某个会话仍未出现，查看工具日志中的远端排除、重复 ID、损坏 rollout 或并发修改原因。
 
-### 需要管理员权限
+### 点击会话后归到另一个项目
 
-先检查是否有以管理员身份运行的 Codex 相关进程。普通情况下不需要提升权限；如果相关数据库确实由更高权限的进程持有，再以相同权限运行本工具。
+这通常是历史 rollout 中的 cwd 与当前项目目录不一致。可见性修复不会猜测并批量改写项目路径；先确认会话实际所属目录，再处理项目迁移问题。
 
-### `target provider must match config.toml`
-
-选择界面显示的当前 Provider。需要切换 Provider 时，先在外部完成切换，再重新扫描。工具不会修改 `config.toml`。
-
-### 验证通过但 JSONL drift 仍存在
-
-这是可能出现的正常结果。JSONL Provider 只读，验证关注的是受支持的 state 与本地 catalog 写入范围。
-
-### 验证通过但侧栏仍未显示全部会话
-
-先重启 Codex，让侧栏重新读取索引。若索引覆盖率已经是 100%，剩余差异通常来自上游侧栏的最近记录显示上限，或会话属于归档、远端和其他排除类别。
-
-### 如何回滚
-
-关闭相关进程后，在桌面端选择“回滚最近一次”，或执行：
-
-```powershell
-codex-provider-hub.exe restore
-```
-
-也可以指定 `CODEX_HOME/backups/provider-hub` 下的某个备份目录。
-
-## 本地运行
+## 本地开发
 
 需要：
 
-- Node.js 和 npm；
-- Rust stable 和 Cargo；
-- 当前操作系统要求的 Tauri 2 原生依赖；
-- Windows 上可用的 WebView2 Runtime。
+- Node.js 与 npm；
+- Rust stable 与 Cargo；
+- Tauri 2 对应平台的原生构建依赖；
+- Windows 上的 WebView2 Runtime。
 
-安装依赖并启动完整桌面环境：
+安装依赖并启动桌面开发环境：
 
-```powershell
+~~~powershell
 npm ci
 npm run tauri -- dev
-```
+~~~
 
-`npm run dev` 只启动 Vite，不包含 Rust core 和 Tauri IPC。开发时的 `http://localhost:1420` 只是 WebView 资源地址，不是产品的浏览器模式。直接用浏览器打开时只会看到“请从 Tauri 桌面端启动”的提示。
+常用检查：
 
-## 验证和构建
-
-```powershell
+~~~powershell
 npm run build
 cargo fmt --manifest-path src-tauri/Cargo.toml -- --check
 cargo check --manifest-path src-tauri/Cargo.toml
-cargo clippy --manifest-path src-tauri/Cargo.toml --lib -- -D warnings
-cargo test --manifest-path src-tauri/Cargo.toml --lib
-```
+cargo clippy --manifest-path src-tauri/Cargo.toml
+cargo test --manifest-path src-tauri/Cargo.toml
+~~~
 
-隔离测试使用临时 `CODEX_HOME`，覆盖 dry-run 零写入、WAL 无副作用、remote-only 跳过、内容缺失跳过、归档和自动化跳过、备份、修复、验证、幂等和恢复。测试不会写入当前用户的真实 `~/.codex`。
+<code>npm run dev</code> 只启动 Vite 前端开发服务器，不是另一个浏览器版本，也不包含 Rust core 与 Tauri IPC。完整功能必须通过 <code>npm run tauri -- dev</code> 或桌面 EXE 运行。
 
-## 打包和部署
+## 构建与发布产物
 
-这是桌面软件，不需要部署 Web 服务器：
+### 当前平台构建
 
-```powershell
+~~~powershell
+npm ci
 npm run tauri -- build
-```
+~~~
 
-Windows 构建输出：
+Windows 常见输出：
 
-```text
+~~~text
 src-tauri/target/release/codex-provider-hub.exe
 src-tauri/target/release/codex-provider-hub-cli.exe
-src-tauri/target/release/bundle/msi/Codex Provider Hub_0.1.0_x64_en-US.msi
-src-tauri/target/release/bundle/nsis/Codex Provider Hub_0.1.0_x64-setup.exe
-```
+src-tauri/target/release/bundle/msi/*.msi
+src-tauri/target/release/bundle/nsis/*-setup.exe
+~~~
 
-主程序、安装包和 CLI 都应作为同一版本 GitHub Release 的附件发布。tag 只指向源码提交，二进制文件实际挂在与该 tag 关联的 Release 页面上。
+<code>codex-provider-hub.exe</code> 是可直接双击运行的 GUI 程序；安装包更适合普通用户分发。Windows 10/11 通常已包含 WebView2，缺失时需要先安装 Microsoft Edge WebView2 Runtime。
 
-macOS 和 Linux 应分别在对应系统或 CI matrix 中执行同一构建命令。`tauri.conf.json` 中的 `targets: "all"` 表示生成当前平台支持的 bundle，不表示 Windows 会交叉生成 macOS 或 Linux 安装包。
+macOS 与 Linux 应在对应系统或 CI runner 上分别构建。Tauri 会按平台生成 <code>.app/.dmg</code>、<code>.deb</code>、<code>.rpm</code> 或 <code>.AppImage</code> 等产物，具体类型取决于该平台安装的打包工具。
 
-公开分发前还需要按平台配置代码签名。macOS 通常还需要公证；当前仓库没有自动更新、签名、公证或发布流水线配置。
+### 首次发布建议
+
+1. 同步 <code>package.json</code>、<code>src-tauri/Cargo.toml</code> 和 <code>src-tauri/tauri.conf.json</code> 的版本号。
+2. 在 Windows、macOS、Linux 上分别完成构建和基本流程验证。
+3. 创建形如 <code>v0.1.0</code> 的 Git tag。
+4. 在对应 GitHub Release 中上传各平台安装包、便携 GUI、可选 CLI 与 SHA-256 校验文件。
+5. 在 Release Notes 中说明支持范围、已知限制和升级注意事项。
+
+本地构建不会自动创建或发布 Git tag。发版应在测试通过后单独执行。
 
 ## 项目结构
 
-```text
-src/                    React/TypeScript 桌面界面
-src-tauri/src/core.rs   扫描、计划、备份、修复、验证和恢复核心
-src-tauri/src/main.rs   无控制台的桌面入口
-src-tauri/src/bin/      独立 CLI 入口
-src-tauri/src/lib.rs    Tauri 命令桥接
-src-tauri/src/main.rs   桌面与 CLI 入口
-src-tauri/icons/        Windows、macOS、Linux 及移动端图标资源
-src-tauri/tauri.conf.json
-```
+~~~text
+src/                         React/TypeScript 桌面界面
+src-tauri/src/core.rs        扫描、计划、备份、修复与验证
+src-tauri/src/rollout.rs     rollout 解析与精确元数据更新
+src-tauri/src/platform.rs    Windows 原生进程、锁与系统操作
+src-tauri/src/lib.rs         Tauri 命令入口
+src-tauri/src/bin/           CLI 入口
+src-tauri/tauri.conf.json    桌面窗口与 bundle 配置
+~~~

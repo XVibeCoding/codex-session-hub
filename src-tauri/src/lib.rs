@@ -1,6 +1,14 @@
 pub mod core;
+pub mod platform;
+pub mod projection;
+pub mod rollout;
 
-use core::{BackupResult, RepairResult, ScanResult, VerifyResult};
+use core::{
+    BackupResult, DesktopRefreshResult, ProjectionPreviewResult, RepairResult, ScanResult,
+    VerifyResult,
+};
+use platform::{BlockingProcess, CloseProcessResult, ProcessIdentity};
+use projection::ProjectionScope;
 use std::path::PathBuf;
 
 fn home() -> PathBuf {
@@ -8,37 +16,180 @@ fn home() -> PathBuf {
 }
 
 #[tauri::command]
-fn scan_codex() -> Result<ScanResult, String> {
-    core::scan_at(&home())
+async fn scan_codex() -> Result<ScanResult, String> {
+    tauri::async_runtime::spawn_blocking(|| core::scan_at(&home()))
+        .await
+        .map_err(|error| error.to_string())?
 }
 
 #[tauri::command]
-fn create_backup() -> Result<BackupResult, String> {
-    core::create_backup_safe_at(&home())
+async fn refresh_desktop(
+    selected_sources: Vec<String>,
+    target_provider: String,
+    observed_provider: String,
+    initialize: bool,
+) -> Result<DesktopRefreshResult, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        core::refresh_desktop_at(
+            &home(),
+            &selected_sources,
+            &target_provider,
+            &observed_provider,
+            ProjectionScope::All,
+            initialize,
+        )
+    })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 #[tauri::command]
-fn repair_indexes(target_provider: String, dry_run: bool) -> Result<RepairResult, String> {
-    core::repair_at(&home(), &target_provider, dry_run, true)
+async fn create_backup() -> Result<BackupResult, String> {
+    tauri::async_runtime::spawn_blocking(|| core::create_backup_safe_at(&home()))
+        .await
+        .map_err(|error| error.to_string())?
 }
 
 #[tauri::command]
-fn verify_codex(target_provider: String) -> Result<VerifyResult, String> {
-    core::verify_at(&home(), &target_provider)
+async fn preview_projection(
+    selected_sources: Vec<String>,
+    target_provider: String,
+    selected_thread_ids: Option<Vec<String>>,
+) -> Result<ProjectionPreviewResult, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        core::preview_projection_selected_at(
+            &home(),
+            &selected_sources,
+            &target_provider,
+            ProjectionScope::All,
+            selected_thread_ids.as_deref(),
+        )
+    })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 #[tauri::command]
-fn rollback_latest() -> Result<VerifyResult, String> {
-    core::restore_latest_at(&home())
+async fn repair_indexes(
+    selected_sources: Vec<String>,
+    target_provider: String,
+    selected_thread_ids: Option<Vec<String>>,
+    dry_run: bool,
+    plan_token: Option<String>,
+) -> Result<RepairResult, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        core::repair_projection_selected_at(
+            &home(),
+            &selected_sources,
+            &target_provider,
+            ProjectionScope::All,
+            selected_thread_ids.as_deref(),
+            dry_run,
+            true,
+            plan_token.as_deref(),
+        )
+    })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 #[tauri::command]
-fn restore_backup(backup_path: Option<String>) -> Result<VerifyResult, String> {
-    let codex_home = home();
-    let requested = backup_path.as_deref().map(std::path::Path::new);
-    core::restore_backup_at(&codex_home, requested)?;
-    let scan = core::scan_at(&codex_home)?;
-    core::verify_at(&codex_home, &scan.current_provider)
+async fn verify_codex(
+    selected_sources: Vec<String>,
+    target_provider: String,
+    selected_thread_ids: Option<Vec<String>>,
+) -> Result<VerifyResult, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        core::verify_projection_selected_at(
+            &home(),
+            &selected_sources,
+            &target_provider,
+            ProjectionScope::All,
+            selected_thread_ids.as_deref(),
+        )
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+async fn rollback_latest() -> Result<VerifyResult, String> {
+    tauri::async_runtime::spawn_blocking(|| core::restore_latest_at(&home()))
+        .await
+        .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+async fn restore_backup(backup_path: Option<String>) -> Result<VerifyResult, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let codex_home = home();
+        let requested = backup_path.as_deref().map(std::path::Path::new);
+        core::restore_backup_at(&codex_home, requested)
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+async fn list_blocking_processes() -> Result<Vec<BlockingProcess>, String> {
+    tauri::async_runtime::spawn_blocking(|| platform::blocking_processes(&home()))
+        .await
+        .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+async fn close_blocking_process(
+    identity: ProcessIdentity,
+    force: bool,
+) -> Result<CloseProcessResult, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        Ok(platform::close_process(&home(), &identity, force))
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+async fn reopen_codex(executable_path: String) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        platform::reopen_codex(std::path::Path::new(&executable_path))
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+async fn open_project_folder(path: String) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || platform::open_folder(std::path::Path::new(&path)))
+        .await
+        .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+async fn reveal_rollout_file(path: String) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let codex_home = home();
+        let requested = std::fs::canonicalize(&path)
+            .map_err(|error| format!("cannot locate rollout file ({path}): {error}"))?;
+        if !requested
+            .extension()
+            .and_then(|value| value.to_str())
+            .is_some_and(|value| value.eq_ignore_ascii_case("jsonl"))
+        {
+            return Err("refusing to reveal a non-JSONL session file".into());
+        }
+        let allowed = ["sessions", "archived_sessions"].iter().any(|directory| {
+            std::fs::canonicalize(codex_home.join(directory))
+                .map(|root| requested.starts_with(root))
+                .unwrap_or(false)
+        });
+        if !allowed {
+            return Err("rollout file is outside CODEX_HOME".into());
+        }
+        platform::reveal_file(&requested)
+    })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -46,11 +197,18 @@ pub fn run() {
     tauri::Builder::default()
         .invoke_handler(tauri::generate_handler![
             scan_codex,
+            refresh_desktop,
             create_backup,
+            preview_projection,
             repair_indexes,
             verify_codex,
             rollback_latest,
-            restore_backup
+            restore_backup,
+            list_blocking_processes,
+            close_blocking_process,
+            reopen_codex,
+            open_project_folder,
+            reveal_rollout_file
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

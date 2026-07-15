@@ -1,210 +1,716 @@
-import { useEffect, useState } from 'react'
+import {
+  startTransition,
+  useCallback,
+  useDeferredValue,
+  useEffect,
+  useMemo,
+  useState,
+} from 'react'
 import { invoke } from '@tauri-apps/api/core'
 import {
-  Archive, ArrowDownToLine, Check, ChevronDown, CircleAlert, CircleCheck,
-  Database, FileClock, FolderOpen, LockKeyhole, Play, RotateCcw,
-  ShieldCheck, Sparkles, Terminal, X
+  Activity,
+  CheckCircle2,
+  CircleAlert,
+  FolderSearch,
+  LoaderCircle,
+  RefreshCw,
+  Search,
+  ShieldCheck,
+  SlidersHorizontal,
+  Sparkles,
+  X,
 } from 'lucide-react'
+import type {
+  BlockingProcess,
+  CloseResult,
+  DesktopRefresh,
+  LocalSession,
+  LogEntry,
+  Preview,
+  RecoveryMode,
+  RecoveryPhase,
+  RecoveryRange,
+  RepairResult,
+  SessionGroup,
+  VerifyResult,
+} from './app-types'
+import { RecoveryDialog } from './components/RecoveryDialog'
+import { SessionExplorer } from './components/SessionExplorer'
+import { TechnicalDrawer } from './components/TechnicalDrawer'
 
-type Provider = { id: string; name: string; color: string; sessions: number; indexed: number; status: string }
-type LockDetail = { state: string; path: string; ownerPid?: number; ageSeconds?: number; activeProcesses: string[] }
-type Source = { name: string; path: string; records: number; readable: boolean; note: string }
-type Scan = {
-  codexHome: string; currentProvider: string; providers: Provider[]; sessions: number;
-  discoveredSessions: number; orphanedSessions: number;
-  archivedSessions: number; ordinarySessions: number; recoverableSessions: number; recoverableIndexed: number;
-  sessionIndexCovered: number; remoteSessions: number; remoteExcludedSessions: number; automatedSessions: number;
-  rolloutSessions: number; validRolloutSessions: number; indexed: number; sessionIndexed: number;
-  drift: number; providerDrift: number; rolloutProviderDrift: number; missingCatalog: number; skipped: number;
-  missingRollout: number;
-  sqlite: number; jsonl: number; lock: string; lockDetail: LockDetail;
-  needsAdmin: boolean; lastBackup?: string; sources: Source[]
-}
-type RepairResult = {
-  changed: number; providersFixed: number; indexAdded: number; skipped: number;
-  skippedReasons: { threadId?: string; reason: string }[]; dryRun: boolean;
-  verified: boolean; backupPath?: string; lock: string; needsAdmin: boolean
-}
-type VerifyResult = { ok: boolean; checked: number; remaining: number; skipped: number; reasons: { threadId?: string; reason: string }[] }
-type LogEntry = { time: string; tone: 'ok' | 'warn' | 'info'; text: string }
-
-const emptyScan: Scan = {
-  codexHome: '未发现', currentProvider: 'unknown', sessions: 0, discoveredSessions: 0, orphanedSessions: 0, archivedSessions: 0,
-  ordinarySessions: 0, recoverableSessions: 0, recoverableIndexed: 0, sessionIndexCovered: 0,
-  remoteSessions: 0, remoteExcludedSessions: 0, automatedSessions: 0,
-  rolloutSessions: 0, validRolloutSessions: 0, indexed: 0, sessionIndexed: 0, drift: 0, providerDrift: 0,
-  missingCatalog: 0, missingRollout: 0, rolloutProviderDrift: 0, skipped: 0, sqlite: 0, jsonl: 0, lock: 'clear',
-  lockDetail: { state: 'clear', path: '', activeProcesses: [] }, needsAdmin: false,
-  sources: [],
-  providers: [
-    { id: 'custom', name: 'Custom', color: '#2d7b6f', sessions: 0, indexed: 0, status: 'available' },
-    { id: 'openai', name: 'OpenAI', color: '#4779a7', sessions: 0, indexed: 0, status: 'available' },
-    { id: 'codexpilot', name: 'CodexPilot', color: '#b17842', sessions: 0, indexed: 0, status: 'available' }
-  ]
+const LOG_STORAGE_KEY = 'codex-session-repair.logs.v1'
+type SearchScope = 'project' | 'title'
+const searchPlaceholders: Record<SearchScope, string> = {
+  project: '模糊搜索项目名称或路径',
+  title: '模糊搜索会话标题',
 }
 
-function formatTime() { return new Date().toLocaleTimeString('zh-CN', { hour12: false }) }
 function isTauriDesktop() {
   return Boolean((window as unknown as { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__)
 }
 
 async function call<T>(command: string, args?: Record<string, unknown>): Promise<T> {
-  if (!isTauriDesktop()) throw new Error('请从 Tauri 桌面端启动此工具')
+  if (!isTauriDesktop()) throw new Error('此功能仅在 Tauri 桌面应用中可用')
   return invoke<T>(command, args)
 }
 
+async function copyText(value: string) {
+  if (navigator.clipboard?.writeText) {
+    await navigator.clipboard.writeText(value)
+    return
+  }
+  const textarea = document.createElement('textarea')
+  textarea.value = value
+  textarea.style.position = 'fixed'
+  textarea.style.opacity = '0'
+  document.body.appendChild(textarea)
+  textarea.select()
+  const copied = document.execCommand('copy')
+  textarea.remove()
+  if (!copied) throw new Error('系统剪贴板不可用')
+}
+
+function readLogs(): LogEntry[] {
+  try {
+    const value = JSON.parse(localStorage.getItem(LOG_STORAGE_KEY) ?? '[]')
+    return Array.isArray(value) ? value.slice(0, 100) : []
+  } catch {
+    return []
+  }
+}
+
+function createLog(tone: LogEntry['tone'], text: string): LogEntry {
+  const now = new Date()
+  return {
+    id: `${now.getTime()}-${Math.random().toString(16).slice(2)}`,
+    time: now.toLocaleTimeString('zh-CN', { hour12: false }),
+    tone,
+    text,
+  }
+}
+
+function groupSessions(sessions: LocalSession[]): SessionGroup[] {
+  const groups = new Map<string, SessionGroup>()
+  for (const session of sessions) {
+    const path = session.cwd.trim() || '未归类路径'
+    const key = path.toLocaleLowerCase()
+    const existing = groups.get(key)
+    if (existing) {
+      existing.sessions.push(session)
+      existing.latest = Math.max(existing.latest, session.updatedAt)
+      continue
+    }
+    groups.set(key, {
+      key,
+      name: session.projectName || '未归类项目',
+      path,
+      sessions: [session],
+      latest: session.updatedAt,
+    })
+  }
+  return [...groups.values()].sort((left, right) => right.latest - left.latest)
+}
+
+function fuzzyIncludes(value: string, query: string) {
+  const normalizedValue = value.toLocaleLowerCase().replace(/\s+/g, ' ').trim()
+  return query.split(/\s+/).every(token => normalizedValue.includes(token))
+}
+
+function sessionMatchesSearch(session: LocalSession, query: string, scope: SearchScope) {
+  if (!query) return true
+  if (scope === 'project') {
+    return [session.projectName, session.cwd].some(value => fuzzyIncludes(value, query))
+  }
+  return fuzzyIncludes(session.title, query)
+}
+
+function uniqueProcessGroups(processes: BlockingProcess[]) {
+  return [...new Map(
+    processes.map(process => [process.applicationRootPid ?? process.identity.pid, process]),
+  ).values()]
+}
+
+function isDatabaseBusy(error: unknown) {
+  return /SQLITE_(?:BUSY|LOCKED|WRITE_CONFLICT)|database(?: table)? is locked|database is busy|resource busy/i.test(String(error))
+}
+
+function errorMessage(error: unknown) {
+  const message = String(error)
+    .replace(/^Error:\s*/i, '')
+    .replace(/^IPC error:\s*/i, '')
+  if (isDatabaseBusy(message)) {
+    return '会话数据库正在写入，在线恢复暂时未获得写入窗口。可以直接重试；若持续发生，再安全关闭占用程序后继续。'
+  }
+  if (/active processes|SQLite resources are owned/i.test(message)) {
+    return '当前修复操作需要独占会话数据库。请保存正在进行的工作，并在确认后使用关闭占用程序的兜底流程。'
+  }
+  if (/plan changed|latest preview|plan token/i.test(message)) {
+    return '会话数据在检查后发生了变化，工具会在重试时重新扫描。'
+  }
+  if (/administrator|permission|access is denied/i.test(message)) {
+    return 'Windows 拒绝了本次操作。通常先关闭相关 Codex 实例即可，不建议默认以管理员身份运行。'
+  }
+  return message
+}
+
 export default function App() {
-  const [scan, setScan] = useState<Scan>(emptyScan)
-  const [selected, setSelected] = useState('openai')
-  const [logs, setLogs] = useState<LogEntry[]>([{ time: formatTime(), tone: 'info', text: '等待桌面端扫描 CODEX_HOME' }])
-  const [busy, setBusy] = useState<'scan' | 'backup' | 'repair' | 'rollback' | 'verify' | null>('scan')
-  const [dryRun, setDryRun] = useState(true)
-  const [showAllLogs, setShowAllLogs] = useState(false)
+  const [desktop, setDesktop] = useState<DesktopRefresh | null>(null)
+  const [query, setQuery] = useState('')
+  const deferredQuery = useDeferredValue(query.trim().toLocaleLowerCase())
+  const [searchScope, setSearchScope] = useState<SearchScope>('title')
+  const [selectedIds, setSelectedIds] = useState<Set<string>>(() => new Set())
+  const [expandedGroups, setExpandedGroups] = useState<Set<string>>(() => new Set())
+  const [scanning, setScanning] = useState(true)
+  const [scanError, setScanError] = useState<string | null>(null)
+  const [logs, setLogs] = useState<LogEntry[]>(readLogs)
   const [toast, setToast] = useState<string | null>(null)
 
-  const selectedProvider = scan.providers.find(provider => provider.id === selected) ?? scan.providers[0]
-  const addLog = (tone: LogEntry['tone'], text: string) => setLogs(prev => [{ time: formatTime(), tone, text }, ...prev])
-  const logLockState = (value: Scan) => {
-    if (value.lockDetail.activeProcesses.includes('process-enumeration-failed')) {
-      addLog('warn', '无法枚举 Codex 进程，写入已锁定；可能需要管理员权限')
-    } else if (value.lockDetail.activeProcesses.length > 0) {
-      const names = value.lockDetail.activeProcesses.slice(0, 4).join('、')
-      const extra = value.lockDetail.activeProcesses.length > 4 ? ` 等 ${value.lockDetail.activeProcesses.length} 个进程` : ''
-      addLog('warn', `写入已锁定：请先关闭 ${names}${extra}`)
-    } else if (value.needsAdmin) {
-      addLog('warn', '部分来源无权访问，可能需要管理员权限')
+  const [recoveryOpen, setRecoveryOpen] = useState(false)
+  const [recoveryRange, setRecoveryRange] = useState<RecoveryRange>('all')
+  const [recoveryMode, setRecoveryMode] = useState<RecoveryMode>('safe')
+  const [recoveryPhase, setRecoveryPhase] = useState<RecoveryPhase>('idle')
+  const [advancedOpen, setAdvancedOpen] = useState(false)
+  const [activePreview, setActivePreview] = useState<Preview | null>(null)
+  const [repairResult, setRepairResult] = useState<RepairResult | null>(null)
+  const [recoveryError, setRecoveryError] = useState<string | null>(null)
+  const [recoveryLockConflict, setRecoveryLockConflict] = useState(false)
+  const [restartPath, setRestartPath] = useState<string | null>(null)
+  const [technicalOpen, setTechnicalOpen] = useState(false)
+
+  const addLog = useCallback((tone: LogEntry['tone'], text: string) => {
+    setLogs(current => [createLog(tone, text), ...current].slice(0, 100))
+  }, [])
+
+  useEffect(() => {
+    localStorage.setItem(LOG_STORAGE_KEY, JSON.stringify(logs))
+  }, [logs])
+
+  useEffect(() => {
+    if (!toast) return
+    const timer = window.setTimeout(() => setToast(null), 2600)
+    return () => window.clearTimeout(timer)
+  }, [toast])
+
+  const refreshDesktop = useCallback(async (initialize: boolean) => {
+    setScanning(true)
+    setScanError(null)
+    try {
+      const result = await call<DesktopRefresh>('refresh_desktop', {
+        selectedSources: desktop?.selectedSources ?? [],
+        targetProvider: desktop?.targetProvider ?? desktop?.scan.currentProvider ?? '',
+        observedProvider: desktop?.scan.currentProvider ?? 'unknown',
+        initialize,
+      })
+      setDesktop(result)
+      setSelectedIds(current => {
+        const available = new Set(result.localSessions.map(session => session.id))
+        return new Set([...current].filter(id => available.has(id)))
+      })
+      addLog(
+        'ok',
+        `扫描完成：发现 ${result.localSessions.length} 个本地会话，已排除 ${result.scan.remoteExcludedSessions} 个明确远端会话。`,
+      )
+      return result
+    } catch (error) {
+      const message = errorMessage(error)
+      setScanError(message)
+      addLog('warn', `扫描失败：${message}`)
+      throw error
+    } finally {
+      setScanning(false)
+    }
+  }, [addLog, desktop])
+
+  useEffect(() => {
+    if (!isTauriDesktop()) {
+      setScanning(false)
+      return
+    }
+    void refreshDesktop(true).catch(() => undefined)
+  }, [])
+
+  const sessions = desktop?.localSessions ?? []
+  const filteredSessions = useMemo(() => {
+    return sessions.filter(session => sessionMatchesSearch(session, deferredQuery, searchScope))
+  }, [deferredQuery, searchScope, sessions])
+  const groups = useMemo(() => groupSessions(filteredSessions), [filteredSessions])
+  const recoverableCount = useMemo(
+    () => sessions.reduce((count, session) => count + Number(session.status === 'recoverable'), 0),
+    [sessions],
+  )
+  const attentionCount = useMemo(
+    () => sessions.reduce((count, session) => count + Number(session.status === 'needsConfirmation'), 0),
+    [sessions],
+  )
+  const archivedCount = useMemo(
+    () => sessions.reduce((count, session) => count + Number(session.status === 'archived'), 0),
+    [sessions],
+  )
+  const selectedCount = selectedIds.size
+
+  const selectedThreadIds = useCallback((range: RecoveryRange) => (
+    range === 'selected' ? [...selectedIds] : undefined
+  ), [selectedIds])
+
+  const previewRecovery = useCallback(async (
+    range: RecoveryRange,
+    sourceDesktop = desktop,
+  ) => {
+    if (!sourceDesktop) return null
+    setRecoveryPhase('previewing')
+    setActivePreview(null)
+    setRecoveryError(null)
+    setRecoveryLockConflict(false)
+    try {
+      const preview = await call<Preview>('preview_projection', {
+        selectedSources: sourceDesktop.selectedSources,
+        targetProvider: sourceDesktop.targetProvider,
+        selectedThreadIds: selectedThreadIds(range),
+      })
+      setActivePreview(preview)
+      setRecoveryPhase('idle')
+      addLog(
+        'info',
+        `恢复检查完成：${preview.changedThreads} 个会话需要深度处理，其中 ${preview.rolloutUpdates} 个需要同步会话元数据。`,
+      )
+      return preview
+    } catch (error) {
+      const message = errorMessage(error)
+      setRecoveryError(message)
+      setRecoveryPhase('error')
+      addLog('warn', `恢复检查失败：${message}`)
+      return null
+    }
+  }, [addLog, desktop, selectedThreadIds])
+
+  const openRecovery = () => {
+    const range: RecoveryRange = selectedCount > 0 ? 'selected' : 'all'
+    setRecoveryRange(range)
+    setRecoveryMode('safe')
+    setRepairResult(null)
+    setRecoveryError(null)
+    setRecoveryLockConflict(false)
+    setRestartPath(null)
+    setRecoveryOpen(true)
+    void previewRecovery(range)
+  }
+
+  const changeRecoveryRange = (range: RecoveryRange) => {
+    setRecoveryRange(range)
+    void previewRecovery(range)
+  }
+
+  const closeBlockingProcesses = useCallback(async (processes: BlockingProcess[]) => {
+    const groups = uniqueProcessGroups(processes)
+    const protectedProcess = groups.find(process => !process.closeAllowed)
+    if (protectedProcess) {
+      throw new Error(`${protectedProcess.identity.name} 无法由工具安全关闭，请手动关闭后重试。`)
+    }
+    const restartable = groups.find(process => process.restartable && process.identity.path)
+    if (restartable?.identity.path) setRestartPath(restartable.identity.path)
+
+    for (const process of groups) {
+      const result = await call<CloseResult>('close_blocking_process', {
+        identity: process.identity,
+        force: false,
+      })
+      addLog(result.exited ? 'ok' : 'warn', `${process.identity.name}：${result.message}`)
+      if (!result.exited) {
+        throw new Error(`${process.identity.name} 未能安全退出。请先保存工作并手动关闭该程序。`)
+      }
+    }
+  }, [addLog])
+
+  const performRecovery = useCallback(async (current: DesktopRefresh) => {
+    setRecoveryPhase('previewing')
+    const latestPreview = await call<Preview>('preview_projection', {
+      selectedSources: current.selectedSources,
+      targetProvider: current.targetProvider,
+      selectedThreadIds: selectedThreadIds(recoveryRange),
+    })
+    setActivePreview(latestPreview)
+    setRecoveryPhase('repairing')
+    addLog('info', '开始在线备份并修复会话元数据与本地索引；Codex 可保持运行。')
+    const result = await call<RepairResult>('repair_indexes', {
+      selectedSources: current.selectedSources,
+      targetProvider: current.targetProvider,
+      selectedThreadIds: selectedThreadIds(recoveryRange),
+      dryRun: false,
+      planToken: latestPreview.planToken,
+    })
+    setRepairResult(result)
+
+    setRecoveryPhase('verifying')
+    try {
+      await refreshDesktop(false)
+    } catch (error) {
+      addLog('warn', `后端修复已完成，但会话列表刷新失败：${errorMessage(error)}`)
+    }
+    setRecoveryPhase('success')
+    if (result.verified) {
+      setToast('会话可见性已恢复')
+      addLog(
+        'ok',
+        `恢复完成并通过后端验证：处理 ${result.changedThreads} 个会话，其中 ${result.rolloutUpdates} 个已同步会话元数据。`,
+      )
+    } else {
+      setToast('已恢复可安全处理的会话')
+      addLog('warn', `在线恢复已提交；${result.skipped} 个记录因冲突或边界规则被安全跳过。`)
+    }
+  }, [addLog, recoveryRange, refreshDesktop, selectedThreadIds])
+
+  const startRecovery = useCallback(async () => {
+    if (!desktop) return
+    setRecoveryError(null)
+    setRecoveryLockConflict(false)
+    setRepairResult(null)
+    try {
+      const current = await refreshDesktop(false)
+      await performRecovery(current)
+    } catch (error) {
+      const message = errorMessage(error)
+      const lockConflict = isDatabaseBusy(error)
+      setRecoveryError(message)
+      setRecoveryLockConflict(lockConflict)
+      setRecoveryPhase('error')
+      if (lockConflict) {
+        addLog('warn', '在线恢复遇到真实数据库写冲突；未关闭任何程序，可直接重试或使用安全关闭兜底。')
+      }
+      addLog('warn', `恢复未完成：${message}`)
+    }
+  }, [
+    addLog,
+    desktop,
+    performRecovery,
+    refreshDesktop,
+  ])
+
+  const closeProcessesAndRetry = useCallback(async () => {
+    if (!desktop) return
+    setRecoveryError(null)
+    setRecoveryLockConflict(false)
+    setRepairResult(null)
+    try {
+      setRecoveryPhase('closing')
+      const current = await refreshDesktop(false)
+      if (current.blockingProcesses.length > 0) {
+        addLog('info', '用户确认使用兜底流程：正在安全关闭占用会话数据库的程序。')
+        await closeBlockingProcesses(current.blockingProcesses)
+      } else {
+        addLog('info', '未发现仍占用会话数据库的程序，直接重试在线恢复。')
+      }
+      const ready = current.blockingProcesses.length > 0
+        ? await refreshDesktop(false)
+        : current
+      await performRecovery(ready)
+    } catch (error) {
+      const message = errorMessage(error)
+      setRecoveryError(message)
+      setRecoveryLockConflict(isDatabaseBusy(error))
+      setRecoveryPhase('error')
+      addLog('warn', `兜底恢复未完成：${message}`)
+    }
+  }, [addLog, closeBlockingProcesses, desktop, performRecovery, refreshDesktop])
+
+  const rollback = useCallback(async () => {
+    const pendingRepair = desktop?.scan.pendingOperation?.command === 'repair'
+    if (!pendingRepair && !desktop?.scan.lastBackup) return
+    try {
+      if (pendingRepair) {
+        const confirmed = window.confirm(
+          '安全回滚只撤销本次修复仍保持工具写入值的会话元数据与本地索引字段；Codex 后续新增或已经修改的数据会保留。\n\n可以保持 Codex 运行。是否继续？',
+        )
+        if (!confirmed) {
+          addLog('info', '已取消安全回滚，当前数据保持不变。')
+          return
+        }
+        setRecoveryPhase('rollingBack')
+        await call<VerifyResult>('rollback_latest')
+        await refreshDesktop(false)
+        setRecoveryOpen(false)
+        setRecoveryPhase('idle')
+        setToast('未完成修复已安全回滚')
+        addLog('ok', '未完成修复已按逐行条件安全回滚，Codex 后续数据已保留。')
+        return
+      }
+
+      const current = await refreshDesktop(false)
+      if (current.blockingProcesses.length > 0) {
+        const message = '离线回滚前请先手动关闭 Codex。在线修复不会自动关闭程序，也不会自动触发整库回滚。'
+        setToast('离线回滚前请先关闭 Codex')
+        addLog('warn', message)
+        return
+      }
+      const confirmed = window.confirm(
+        '离线回滚会恢复修复前的官方会话索引、rollout Provider 元数据与本地投影状态，修复后新产生的会话活动可能被撤销。\n\n请确认已关闭 Codex，并且确实需要回滚。',
+      )
+      if (!confirmed) {
+        addLog('info', '已取消离线回滚，当前数据保持不变。')
+        return
+      }
+      setRecoveryPhase('rollingBack')
+      await call<VerifyResult>('rollback_latest')
+      await refreshDesktop(false)
+      setRecoveryOpen(false)
+      setRecoveryPhase('idle')
+      setToast('已回滚最近一次恢复')
+      addLog('ok', '最近一次修复备份已恢复。')
+    } catch (error) {
+      const message = errorMessage(error)
+      setRecoveryError(message)
+      setRecoveryPhase('error')
+      addLog('warn', `回滚失败：${message}`)
+    }
+  }, [addLog, desktop?.scan.lastBackup, desktop?.scan.pendingOperation?.command, refreshDesktop])
+
+  const reopenCodex = useCallback(async () => {
+    if (!restartPath) {
+      setRecoveryOpen(false)
+      return
+    }
+    try {
+      await call('reopen_codex', { executablePath: restartPath })
+      addLog('ok', `已重新打开 Codex：${restartPath}`)
+      setRecoveryOpen(false)
+    } catch (error) {
+      const message = errorMessage(error)
+      setRecoveryError(message)
+      setRecoveryPhase('error')
+      addLog('warn', `重新打开 Codex 失败：${message}`)
+    }
+  }, [addLog, restartPath])
+
+  const toggleSession = (id: string) => {
+    setSelectedIds(current => {
+      const next = new Set(current)
+      if (next.has(id)) next.delete(id)
+      else next.add(id)
+      return next
+    })
+  }
+
+  const toggleGroupSelection = (group: SessionGroup) => {
+    setSelectedIds(current => {
+      const next = new Set(current)
+      const allSelected = group.sessions.every(session => next.has(session.id))
+      for (const session of group.sessions) {
+        if (allSelected) next.delete(session.id)
+        else next.add(session.id)
+      }
+      return next
+    })
+  }
+
+  const toggleGroupOpen = (key: string) => {
+    startTransition(() => {
+      setExpandedGroups(current => {
+        const next = new Set(current)
+        if (next.has(key)) next.delete(key)
+        else next.add(key)
+        return next
+      })
+    })
+  }
+
+  const openProjectFolder = async (group: SessionGroup) => {
+    try {
+      await call<string>('open_project_folder', { path: group.path })
+      setToast(`已打开项目文件夹：${group.name}`)
+    } catch (error) {
+      const message = errorMessage(error)
+      setToast(`无法打开项目文件夹：${message}`)
+      addLog('warn', `打开项目文件夹失败：${group.path}，${message}`)
     }
   }
 
-  const applyScan = (value: Scan) => {
-    setScan(value)
-    setSelected(value.providers.some(provider => provider.id === value.currentProvider) ? value.currentProvider : 'openai')
-  }
-
-  useEffect(() => {
-    let mounted = true
-    call<Scan>('scan_codex')
-      .then(value => { if (mounted) { applyScan(value); addLog('ok', `扫描完成：${value.recoverableSessions} 条可恢复，${value.missingCatalog} 条待恢复，${value.remoteSessions} 条远端映射`); logLockState(value) } })
-      .catch(error => { if (mounted) { addLog('warn', String(error)); setToast(String(error)) } })
-      .finally(() => { if (mounted) setBusy(null) })
-    return () => { mounted = false }
-  }, [])
-
-  const runScan = async () => {
-    setBusy('scan')
+  const copySessionId = async (session: LocalSession) => {
     try {
-      const result = await call<Scan>('scan_codex')
-      applyScan(result)
-      addLog('ok', `扫描完成：${result.recoverableSessions} 条可恢复，侧栏覆盖 ${result.recoverableIndexed}/${result.recoverableSessions}，远端 ${result.remoteSessions} 条`)
-      logLockState(result)
-      setToast('扫描完成')
+      await copyText(session.id)
+      setToast('已复制完整会话 ID')
     } catch (error) {
-      addLog('warn', `扫描失败：${String(error)}`); setToast('扫描失败')
-    } finally { setBusy(null) }
+      const message = errorMessage(error)
+      setToast(`复制会话 ID 失败：${message}`)
+      addLog('warn', `复制会话 ID 失败：${session.id}，${message}`)
+    }
   }
 
-  const createBackup = async () => {
-    setBusy('backup')
+  const revealRollout = async (session: LocalSession) => {
+    if (!session.rolloutPath) return
     try {
-      const result = await call<{ path: string }>('create_backup')
-      setScan(prev => ({ ...prev, lastBackup: result.path }))
-      addLog('ok', `SQLite 在线快照已创建 · ${result.path}`)
-      setToast('备份完成')
+      await call<string>('reveal_rollout_file', { path: session.rolloutPath })
+      setToast('已在文件管理器中定位 rollout JSONL')
     } catch (error) {
-      addLog('warn', `备份失败：${String(error)}`); setToast('备份失败')
-    } finally { setBusy(null) }
+      const message = errorMessage(error)
+      setToast(`无法定位 rollout JSONL：${message}`)
+      addLog('warn', `定位 rollout JSONL 失败：${session.rolloutPath}，${message}`)
+    }
   }
 
-  const verify = async (provider = selected) => {
-    setBusy('verify')
-    try {
-      const result = await call<VerifyResult>('verify_codex', { targetProvider: provider })
-      addLog(result.ok ? 'ok' : 'warn', result.ok ? `验证通过：检查 ${result.checked} 条候选` : `验证未通过：仍有 ${result.remaining} 条记录待处理`)
-      setToast(result.ok ? '验证通过' : '仍有记录待处理')
-    } catch (error) {
-      addLog('warn', `验证失败：${String(error)}`); setToast('验证失败')
-    } finally { setBusy(null) }
-  }
-
-  const repair = async () => {
-    if (!dryRun && !window.confirm('将创建 SQLite 快照并修改两套本地索引数据库。请先关闭 Codex 相关进程；失败时会尝试自动回滚。继续吗？')) return
-    setBusy('repair')
-    try {
-      const result = await call<RepairResult>('repair_indexes', { targetProvider: selected, dryRun })
-      const mode = dryRun ? '预览' : '同步'
-      addLog(dryRun ? 'info' : 'ok', `${mode}完成：${result.changed} 条变更，provider ${result.providersFixed} 条，新增索引 ${result.indexAdded} 条，跳过 ${result.skipped} 条`)
-      if (result.backupPath) setScan(prev => ({ ...prev, lastBackup: result.backupPath }))
-      if (!dryRun) {
-        const refreshed = await call<Scan>('scan_codex')
-        applyScan(refreshed)
-        addLog(result.verified ? 'ok' : 'warn', result.verified ? '写入后验证通过' : '写入完成但验证未通过')
-      }
-      setToast(dryRun ? '预览完成' : result.verified ? '同步并验证完成' : '同步后仍需检查')
-    } catch (error) {
-      const message = String(error)
-      const restored = /restored backup|was restored|已恢复|已回滚/i.test(message) && !/restore failed|回滚失败/i.test(message)
-      addLog('warn', `修复失败：${message}`); setToast(restored ? '修复失败，已自动回滚' : '修复失败，详情见日志')
-    } finally { setBusy(null) }
-  }
-
-  const rollback = async () => {
-    setBusy('rollback')
-    try {
-      const result = await call<VerifyResult>('rollback_latest')
-      const refreshed = await call<Scan>('scan_codex')
-      applyScan(refreshed)
-      addLog(result.ok ? 'ok' : 'warn', result.ok ? '已回滚并通过当前 provider 验证' : `已回滚；当前 provider 仍有 ${result.remaining} 条未对齐`)
-      setToast('已回滚')
-    } catch (error) {
-      addLog('warn', `回滚失败：${String(error)}`); setToast('回滚失败')
-    } finally { setBusy(null) }
-  }
-
-  const visibleLogs = showAllLogs ? logs : logs.slice(0, 3)
   if (!isTauriDesktop()) {
-    return <div className="desktop-only"><div className="desktop-only-mark"><Sparkles size={20} /></div><h1>Codex Provider Hub</h1><p>请从已安装的 Tauri 桌面端启动，不要直接打开开发服务器地址。</p></div>
+    return (
+      <main className="desktop-required">
+        <span><ShieldCheck size={28} /></span>
+        <h1>请打开桌面应用</h1>
+        <p>Codex 会话恢复只在已安装的 EXE 桌面端运行。浏览器页面不会读取或修改本地会话。</p>
+      </main>
+    )
   }
 
-  const currentProvider = scan.providers.find(provider => provider.id === scan.currentProvider)
-  const globalState = scan.sources.find(source => source.name === 'global_state')
-  const sessionIndex = scan.sources.find(source => source.name === 'session_index')
-  const writeBlocked = scan.lock !== 'clear' || scan.needsAdmin || scan.sqlite < 2 || scan.codexHome === '未发现'
-  const catalogCoverage = scan.recoverableSessions === 0
-    ? '-'
-    : `${Math.round((scan.recoverableIndexed / scan.recoverableSessions) * 100)}%`
-  return <div className="app-shell">
-    <header className="topbar">
-      <div className="brand"><div className="brand-mark"><Sparkles size={17} /></div><div><strong>Codex Provider Hub</strong><span>session repair utility <em>v0.1</em></span></div></div>
-      <div className="top-actions"><span className="runtime"><span className="pulse" />本地运行中</span><span className="avatar" title="本地桌面端">XC</span></div>
-    </header>
+  return (
+    <div className="app-shell">
+      <header className="app-header">
+        <div className="brand-lockup">
+          <span className="brand-mark"><Sparkles size={19} /></span>
+          <span><strong>Codex 会话恢复</strong><small>本地会话可见性修复</small></span>
+        </div>
+        <div className="header-actions">
+          <span
+            className={`runtime-status${scanError ? ' error' : ''}`}
+            role="status"
+            aria-live="polite"
+            title={scanError ?? undefined}
+          >
+            {scanError ? <CircleAlert size={14} /> : <span className="status-dot" />}
+            {scanError ? (desktop ? '刷新失败，显示上次结果' : '扫描异常') : scanning ? '正在扫描' : '本地运行中'}
+          </span>
+          <button className="icon-button" type="button" title="重新扫描" aria-label="重新扫描" onClick={() => void refreshDesktop(false).catch(() => undefined)} disabled={scanning}>
+            <RefreshCw className={scanning ? 'spin' : ''} size={17} />
+          </button>
+          <button className="secondary-button compact-button" type="button" onClick={() => setTechnicalOpen(true)}>
+            <Activity size={16} />技术详情
+          </button>
+        </div>
+      </header>
 
-    <main className="workspace">
-      <section className="intro-row"><div><p className="eyebrow">SESSION VISIBILITY / SAFE RECOVERY</p><h1>让历史会话重新可见。</h1><p className="subhead">对齐 provider 索引，保留原始 JSONL，不改动凭据与配置。</p></div><div className="intro-actions"><button className="secondary-button" onClick={runScan} disabled={busy !== null}><RotateCcw size={16} className={busy === 'scan' ? 'spin' : ''} />{busy === 'scan' ? '扫描中' : '重新扫描'}</button><button className="secondary-button" onClick={() => verify()} disabled={busy !== null}><ShieldCheck size={16} />{busy === 'verify' ? '验证中' : '验证'}</button></div></section>
-
-      <section className="path-strip"><div className="path-icon"><FolderOpen size={16} /></div><div><span>CODEX_HOME</span><strong>{scan.codexHome}</strong></div><div className="strip-divider" /><div><span>当前 Provider</span><strong className="provider-inline"><i style={{ background: currentProvider?.color }} />{currentProvider?.name ?? scan.currentProvider}</strong></div><div className="strip-status"><ShieldCheck size={15} />只读扫描</div></section>
-
-      <section className="metrics" aria-label="扫描概览"><div className="metric"><span>可恢复会话</span><strong>{scan.recoverableSessions}</strong><small>state {scan.sessions} · 普通候选 {scan.ordinarySessions}</small></div><div className="metric"><span>侧栏覆盖</span><strong>{scan.recoverableIndexed}/{scan.recoverableSessions}</strong><small>{catalogCoverage} · session index {scan.sessionIndexCovered}</small></div><div className="metric warn"><span>待恢复</span><strong>{scan.missingCatalog}</strong><small>provider {scan.providerDrift} · 内容异常 {scan.missingRollout}</small></div><div className="metric"><span>远端映射</span><strong>{scan.remoteSessions}</strong><small>排除 {scan.remoteExcludedSessions} · 归档 {scan.archivedSessions} · 孤儿 {scan.orphanedSessions}</small></div></section>
-
-      <div className="content-grid">
-        <section className="main-column">
-          <div className="section-heading"><div><p className="eyebrow">01 / TARGET</p><h2>选择目标 Provider</h2></div><span className="helper">仅处理 allowlist 内的普通本地线程</span></div>
-          <div className="provider-list">{scan.providers.map(provider => <button key={provider.id} className={`provider-row ${selected === provider.id ? 'selected' : ''}`} onClick={() => setSelected(provider.id)} disabled={busy !== null}><span className="provider-color" style={{ background: provider.color }} /><span className="provider-copy"><strong>{provider.name}</strong><small>{provider.id} · {provider.status === 'active' ? '当前配置' : provider.status === 'legacy' ? '历史来源' : '可用来源'}</small></span><span className="provider-count"><strong>{provider.sessions}</strong><small>可恢复</small></span><span className="provider-index"><strong className={provider.sessions !== provider.indexed ? 'text-warn' : ''}>{provider.indexed}</strong><small>已索引</small></span><span className="radio">{selected === provider.id && <Check size={13} />}</span></button>)}</div>
-
-          <div className="section-heading action-heading"><div><p className="eyebrow">02 / RECOVERY</p><h2>安全同步</h2></div><div className="dry-toggle"><span>预览模式</span><button className={`toggle ${dryRun ? 'on' : ''}`} onClick={() => setDryRun(value => !value)} aria-label="切换预览模式" disabled={busy !== null}><span /></button></div></div>
-          <div className="recovery-panel"><div className="recovery-copy"><div className="recovery-icon"><Archive size={19} /></div><div><strong>{dryRun ? '预览修复范围' : '同步会话可见性'}</strong><p>{dryRun ? `检查 ${selectedProvider?.name ?? selected} 的 threads 与 local catalog，不修改文件。` : selected !== scan.currentProvider ? '目标必须与 config.toml 当前 provider 一致，避免修复后再次被侧栏过滤。' : writeBlocked ? '检测到活动进程或权限问题；关闭相关进程后重新扫描。' : '写入前创建 SQLite 在线快照；只更新 provider 与本地索引元数据。'}</p></div></div><button className="primary-button" onClick={repair} disabled={busy !== null || (!dryRun && (selected !== scan.currentProvider || writeBlocked))}><Play size={15} fill="currentColor" />{busy === 'repair' ? '处理中' : dryRun ? '预览修复' : '开始同步'}</button></div>
-          <div className="safety-line"><LockKeyhole size={14} /><span>不会修改 JSONL、session_index、auth.json、config.toml 或 global state</span><span className="dot" /><span>失败自动恢复 SQLite 快照</span></div>
-
-          <div className="section-heading log-heading"><div><p className="eyebrow">03 / ACTIVITY</p><h2>执行日志</h2></div><button className="text-button" onClick={() => setShowAllLogs(value => !value)}>{showAllLogs ? '收起' : '查看全部'}<ChevronDown size={14} className={showAllLogs ? 'flip' : ''} /></button></div>
-          <div className="log-list">{visibleLogs.map((log, index) => <div className="log-row" key={`${log.time}-${index}`}><span className={`log-dot ${log.tone}`} /><time>{log.time}</time><span>{log.text}</span></div>)}</div>
+      <main className="workspace">
+        <section className="workspace-heading">
+          <div>
+            <span className="workspace-kicker">LOCAL CODEX SESSIONS</span>
+            <h1>本地会话</h1>
+            <p>
+              {desktop
+                ? scanError
+                  ? `本次刷新失败，继续显示上次成功加载的 ${sessions.length} 个会话。`
+                  : `${sessions.length} 个本地会话，包含普通、内部和归档记录；明确远端会话暂不进入恢复范围。`
+                : '正在读取本地会话。'}
+            </p>
+          </div>
+          <button className="primary-button repair-button" type="button" onClick={openRecovery} disabled={scanning || !desktop || sessions.length === 0}>
+            <ShieldCheck size={18} />{selectedCount ? `恢复选中的 ${selectedCount} 个会话` : '恢复全部会话'}
+          </button>
         </section>
 
-        <aside className="side-column">
-          <div className="side-block"><div className="side-heading"><h3>操作准备</h3><CircleCheck size={17} /></div><div className="check-row"><span className={`check-icon ${scan.codexHome === '未发现' ? 'warn' : ''}`}>{scan.codexHome === '未发现' ? <CircleAlert size={13} /> : <Check size={13} />}</span><span>CODEX_HOME 已发现</span><small>{scan.codexHome === '未发现' ? 'check' : 'ready'}</small></div><div className="check-row"><span className={`check-icon ${scan.sqlite < 2 ? 'warn' : ''}`}>{scan.sqlite >= 2 ? <Check size={13} /> : <CircleAlert size={13} />}</span><span>{scan.sqlite} 个 SQLite 可读取</span><small>{scan.sqlite >= 2 ? 'ready' : 'check'}</small></div><div className="check-row"><span className={`check-icon ${globalState?.readable && sessionIndex?.readable ? '' : 'warn'}`}>{globalState?.readable && sessionIndex?.readable ? <Check size={13} /> : <CircleAlert size={13} />}</span><span>global state / session index</span><small title={`${globalState?.note ?? '未扫描'} · ${sessionIndex?.note ?? '未扫描'}`}>{globalState?.readable && sessionIndex?.readable ? 'ready' : 'check'}</small></div><div className="check-row"><span className={`check-icon ${writeBlocked ? 'warn' : ''}`}>{writeBlocked ? <CircleAlert size={13} /> : <Check size={13} />}</span><span>进程锁状态</span><small className={writeBlocked ? 'warn-text' : ''} title={scan.lockDetail.activeProcesses.join('、')}>{scan.lock}</small></div></div>
-          <div className="side-block backup-block"><div className="side-heading"><h3>备份与回滚</h3><Database size={17} /></div><p>两套 SQLite 在线快照与完整 manifest；JSONL 只登记、不复制。</p><button className="backup-button" onClick={createBackup} disabled={busy !== null || writeBlocked}><ArrowDownToLine size={15} />{busy === 'backup' ? '创建中' : '创建 SQLite 快照'}</button>{scan.lastBackup && <div className="last-backup"><FileClock size={14} /><span>最近备份<strong>{scan.lastBackup}</strong></span></div>}<button className="rollback-button" onClick={rollback} disabled={!scan.lastBackup || busy !== null || writeBlocked}><RotateCcw size={14} />{busy === 'rollback' ? '回滚中' : '回滚最近一次'}</button></div>
-          <div className="side-block note-block"><div className="side-heading"><h3>扫描说明</h3><CircleAlert size={17} /></div><p>有效 rollout {scan.validRolloutSessions}/{scan.rolloutSessions}；自动化 {scan.automatedSessions}。远端使用 host 与 SSH/WSL/容器强标记识别，source=vscode 本身不代表远端。session_index 仅作诊断。</p><div className="file-chips"><span><Database size={12} /> state_5.sqlite</span><span><Terminal size={12} /> local_thread_catalog</span><span><FileClock size={12} /> rollout JSONL</span></div></div>
-        </aside>
-      </div>
-    </main>
-    {toast && <div className="toast"><CircleCheck size={16} />{toast}<button onClick={() => setToast(null)} aria-label="关闭提示"><X size={14} /></button></div>}
-  </div>
+        <section className="session-workspace">
+          <div className="session-toolbar">
+            <div className="search-field">
+              <Search size={17} />
+              <select
+                aria-label="搜索范围"
+                value={searchScope}
+                onChange={event => setSearchScope(event.target.value as SearchScope)}
+              >
+                <option value="title">会话标题</option>
+                <option value="project">项目名称</option>
+              </select>
+              <span className="search-divider" aria-hidden="true" />
+              <input
+                aria-label={searchPlaceholders[searchScope]}
+                value={query}
+                onChange={event => setQuery(event.target.value)}
+                placeholder={searchPlaceholders[searchScope]}
+              />
+              {query ? <button type="button" aria-label="清除搜索" onClick={() => setQuery('')}><X size={15} /></button> : null}
+            </div>
+            <div className="toolbar-summary">
+              {selectedCount ? <button className="selection-chip" type="button" onClick={() => setSelectedIds(new Set())}>{selectedCount} 个已选择 <X size={13} /></button> : null}
+              <span><CheckCircle2 size={15} />{sessions.length - recoverableCount - attentionCount - archivedCount} 个当前可见</span>
+              <span className="recoverable-summary"><FolderSearch size={15} />{recoverableCount} 个可恢复</span>
+            </div>
+          </div>
+
+          <div className="list-column-head" aria-hidden="true">
+            <span>项目与会话</span><span>原始来源</span><span>状态</span><span>最近更新</span>
+          </div>
+
+          {scanning && !desktop ? (
+            <div className="loading-state"><LoaderCircle className="spin" size={25} /><strong>正在扫描本地会话</strong><span>仅读取索引和会话元数据。</span></div>
+          ) : scanError && !desktop ? (
+            <div className="error-state"><CircleAlert size={25} /><strong>无法读取本地会话</strong><span>{scanError}</span><button className="secondary-button" type="button" onClick={() => void refreshDesktop(true).catch(() => undefined)}>重新扫描</button></div>
+          ) : (
+            <SessionExplorer
+              groups={groups}
+              expandedGroups={expandedGroups}
+              selectedIds={selectedIds}
+              forceOpen={Boolean(deferredQuery)}
+              onToggleGroupOpen={toggleGroupOpen}
+              onToggleGroupSelection={toggleGroupSelection}
+              onToggleSession={toggleSession}
+              onOpenProject={group => void openProjectFolder(group)}
+              onCopySessionId={session => void copySessionId(session)}
+              onRevealRollout={session => void revealRollout(session)}
+            />
+          )}
+
+          <footer className="workspace-footer" aria-label="本地会话环境状态">
+            <span className="footer-source" title={desktop?.scan.codexHome}>
+              <span className="status-dot" />
+              <span className="footer-label">数据目录</span>
+              <code>{desktop?.scan.codexHome ?? '等待扫描'}</code>
+            </span>
+            <span className="footer-meta">
+              <span className="footer-provider" title={desktop?.scan.currentProvider}>
+                <SlidersHorizontal size={15} />
+                <span className="footer-label">Provider</span>
+                <code>{desktop?.scan.currentProvider ?? '-'}</code>
+              </span>
+              <span className="footer-divider" aria-hidden="true" />
+              {desktop?.scan.lastBackup
+                ? <span className="footer-backup"><ShieldCheck size={15} />回滚快照已就绪</span>
+                : <span className="footer-backup"><ShieldCheck size={15} />写入前自动备份</span>}
+            </span>
+          </footer>
+        </section>
+      </main>
+
+      <RecoveryDialog
+        open={recoveryOpen}
+        targetProvider={desktop?.targetProvider ?? '-'}
+        totalCount={sessions.length}
+        selectedCount={selectedCount}
+        range={recoveryRange}
+        mode={recoveryMode}
+        phase={recoveryPhase}
+        preview={activePreview}
+        result={repairResult}
+        blockerCount={desktop?.blockingProcesses.length ?? 0}
+        error={recoveryError}
+        lockConflict={recoveryLockConflict}
+        advancedOpen={advancedOpen}
+        canReopen={Boolean(restartPath)}
+        onClose={() => { if (!['closing', 'repairing', 'verifying', 'rollingBack'].includes(recoveryPhase)) setRecoveryOpen(false) }}
+        onRangeChange={changeRecoveryRange}
+        onModeChange={setRecoveryMode}
+        onAdvancedToggle={() => setAdvancedOpen(value => !value)}
+        onStart={() => void startRecovery()}
+        onRetry={() => void startRecovery()}
+        onCloseAndRetry={() => void closeProcessesAndRetry()}
+        onReopen={() => void reopenCodex()}
+        onRollback={() => void rollback()}
+      />
+
+      <TechnicalDrawer
+        open={technicalOpen}
+        scan={desktop?.scan ?? null}
+        localSessionCount={sessions.length}
+        processes={desktop?.blockingProcesses ?? []}
+        logs={logs}
+        busy={recoveryPhase === 'rollingBack'}
+        onClose={() => setTechnicalOpen(false)}
+        onRollback={() => void rollback()}
+        onClearLogs={() => setLogs([])}
+      />
+
+      {toast ? <div className="toast" role="status" aria-live="polite"><CheckCircle2 size={17} />{toast}</div> : null}
+    </div>
+  )
 }
