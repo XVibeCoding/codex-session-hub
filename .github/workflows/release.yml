@@ -30,7 +30,7 @@ jobs:
       - name: Install frontend dependencies
         run: npm ci
 
-      - name: Build signed NSIS release
+      - name: Build Windows installers and signed updater artifacts
         uses: tauri-apps/tauri-action@v1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -38,7 +38,7 @@ jobs:
         with:
           tagName: v__VERSION__
           releaseName: Codex Provider Hub v__VERSION__
-          releaseBody: Signed Windows installer and in-app updater artifacts.
+          releaseBody: Windows NSIS and MSI installers with signed in-app updater artifacts.
           releaseDraft: true
           prerelease: false
           updaterJsonPreferNsis: true
