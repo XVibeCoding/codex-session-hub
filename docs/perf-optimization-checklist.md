@@ -131,7 +131,7 @@ Primary goal: keep repair safety, make list refresh cheap.
 - [x] Scan path reuses cohorts for eligible provider counts; refresh no longer dual-builds cohorts for list
 - [x] `local_session_summaries` reuses cohorts (no second full cohort rebuild)
 - [x] `scan_result_for_snapshot` accepts precomputed cohorts/eligible instead of rebuilding blindly
-- [ ] When preview **is** requested, it reuses the same shared context rather than rescanning disk (helpers ready; standalone preview still scans once)
+- [x] When preview **is** requested, it reuses the same shared context rather than rescanning disk (process-local fingerprint short cache; apply still force-rescans)
 - [x] Main files: `src-tauri/src/core.rs`
 - [x] Automated tests: scan counts and local session statuses unchanged on fixtures; refresh returns `preview: None`
 
@@ -209,7 +209,7 @@ Primary goal: keep repair safety, make list refresh cheap.
 - [x] Backup list / automatic maintenance uses fast path (manifest + size surface checks) when safe
 - [x] Full hash / `quick_check` reserved for restore-before, latest-backup pick, and cleanup prune
 - [ ] Incomplete/legacy/corrupt classification must not become more aggressive without user confirmation paths already in product
-- [ ] First-launch `maintain_backups_at` should not dominate startup after change (or gate expensive verify)
+- [x] First-launch maintain_backups_at should not dominate startup after change (or gate expensive verify) — deep integrity only on manual cleanup/restore/repair; maintain uses surface prune
 - [ ] Main files: `src-tauri/src/core.rs`
 - [ ] Tests: list/cleanup retention limits still enforced; restore still verifies integrity
 
@@ -226,16 +226,16 @@ Primary goal: keep repair safety, make list refresh cheap.
 
 ### 12. Session list virtualization (or equivalent DOM limit)
 
-- [ ] Avoid mounting thousands of session rows at once
+- [x] Avoid mounting thousands of session rows at once (CSS content-visibility: auto on groups + rows; no react-window dep)
 - [ ] Search / `forceOpen` behaviour does not explode DOM
-- [ ] Keyboard/focus and checkbox selection still work for visible rows
+- [x] Keyboard/focus and checkbox selection still work for visible rows
 - [ ] Main files: `src/components/SessionExplorer.tsx`, `src/App.tsx`, `src/styles.css` (if needed)
 
 ### 13. Memoize list row components
 
 - [x] `SessionRow` memoized
 - [x] Group header memoized where beneficial
-- [ ] Selection toggles do not rebuild unchanged row elements unnecessarily
+- [x] Selection toggles do not rebuild unchanged row elements unnecessarily (stable useCallback props)
 - [ ] Main files: `src/components/SessionExplorer.tsx`
 
 ### 14. Fewer full refreshes during recovery
@@ -307,6 +307,7 @@ Smaller slices are fine; avoid mixing safe-open changes with frontend virtualiza
 | 2026-07-20 | - | Checklist created on branch `codex/perf-light-refresh` | - |
 | 2026-07-20 | docs | Checklist revised: dependencies, code facts, risks, DoD, tests, and commit slicing | - |
 | 2026-07-20 | 1 | P0: slim refresh (no preview/plan_token); shared cohorts; light URI open (immutable only without -wal) | cargo test --lib 102 ok; npm run build ok |
+| 2026-07-21 | 4 | P3: snapshot short cache (fingerprint+TTL); maintain light prune; SessionExplorer stable callbacks + content-visibility | cargo test --lib 104 ok; npm run build ok |
 
 ---
 

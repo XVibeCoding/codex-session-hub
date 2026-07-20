@@ -25,9 +25,9 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicU64, Ordering},
-        Once,
+        Mutex, Once,
     },
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use walkdir::WalkDir;
 
@@ -39,6 +39,9 @@ const MINIMUM_AUTOMATIC_BACKUPS: usize = 2;
 const BACKUP_CAPACITY_LIMIT_BYTES: u64 = 250 * 1024 * 1024;
 const BACKUP_FREE_SPACE_RESERVE_BYTES: u64 = 64 * 1024 * 1024;
 const INCOMPLETE_BACKUP_GRACE: Duration = Duration::from_secs(24 * 60 * 60);
+/// Process-local reuse window so recovery preview can skip a second full scan
+/// immediately after desktop refresh. Apply paths always force a fresh scan.
+const SNAPSHOT_CACHE_TTL: Duration = Duration::from_secs(3);
 
 fn canonical_provider(id: &str) -> String {
     source_provider(id)
@@ -2064,7 +2067,159 @@ fn local_session_summaries_with_cohorts(
     sessions
 }
 
+#[derive(Clone, PartialEq, Eq)]
+struct HomeScanFingerprint {
+    signals: Vec<(String, u64, u64)>,
+}
+
+struct CachedSnapshot {
+    home: PathBuf,
+    fingerprint: HomeScanFingerprint,
+    captured_at: Instant,
+    snapshot: Snapshot,
+}
+
+static SNAPSHOT_CACHE: Mutex<Option<CachedSnapshot>> = Mutex::new(None);
+
+fn system_time_as_millis(value: SystemTime) -> u64 {
+    value
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+fn push_path_fingerprint(signals: &mut Vec<(String, u64, u64)>, label: &str, path: &Path) {
+    match fs::metadata(path) {
+        Ok(metadata) => {
+            let modified = metadata
+                .modified()
+                .map(system_time_as_millis)
+                .unwrap_or(0);
+            signals.push((label.to_owned(), metadata.len(), modified));
+        }
+        Err(_) => {
+            signals.push((label.to_owned(), 0, 0));
+        }
+    }
+}
+
+fn push_jsonl_tree_fingerprint(signals: &mut Vec<(String, u64, u64)>, home: &Path, relative_root: &str) {
+    let root = home.join(relative_root);
+    if !root.is_dir() {
+        signals.push((format!("{relative_root}/"), 0, 0));
+        return;
+    }
+    let mut files = Vec::new();
+    for entry in WalkDir::new(&root).follow_links(false) {
+        let Ok(entry) = entry else {
+            signals.push((format!("{relative_root}/!walk"), 1, 0));
+            continue;
+        };
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        if entry
+            .path()
+            .extension()
+            .and_then(|value| value.to_str())
+            .is_none_or(|value| !value.eq_ignore_ascii_case("jsonl"))
+        {
+            continue;
+        }
+        let relative = entry
+            .path()
+            .strip_prefix(home)
+            .map(|path| path.to_string_lossy().replace('\\', "/"))
+            .unwrap_or_else(|_| entry.path().to_string_lossy().replace('\\', "/"));
+        let metadata = match entry.metadata() {
+            Ok(metadata) => metadata,
+            Err(_) => {
+                files.push((relative, 0u64, 0u64));
+                continue;
+            }
+        };
+        let modified = metadata
+            .modified()
+            .map(system_time_as_millis)
+            .unwrap_or(0);
+        files.push((relative, metadata.len(), modified));
+    }
+    files.sort_by(|left, right| left.0.cmp(&right.0));
+    signals.push((format!("{relative_root}/#count"), files.len() as u64, 0));
+    for (relative, len, modified) in files {
+        signals.push((relative, len, modified));
+    }
+}
+
+fn home_scan_fingerprint(home: &Path) -> HomeScanFingerprint {
+    let mut signals = Vec::new();
+    for relative in [
+        "state_5.sqlite",
+        "state_5.sqlite-wal",
+        "state_5.sqlite-shm",
+        "sqlite/codex-dev.db",
+        "sqlite/codex-dev.db-wal",
+        "sqlite/codex-dev.db-shm",
+        "session_index.jsonl",
+        ".codex-global-state.json",
+        "config.toml",
+    ] {
+        push_path_fingerprint(&mut signals, relative, &home.join(relative));
+    }
+    // Projection store can change eligibility without touching SQLite/jsonl.
+    push_path_fingerprint(
+        &mut signals,
+        "projection-state.json",
+        &projection_state_path(home),
+    );
+    push_jsonl_tree_fingerprint(&mut signals, home, "sessions");
+    push_jsonl_tree_fingerprint(&mut signals, home, "archived_sessions");
+    HomeScanFingerprint { signals }
+}
+
+/// Common-path scan with a short process-local cache (refresh → preview reuse).
 fn scan_snapshot(home: &Path) -> Snapshot {
+    scan_snapshot_with_cache(home, true)
+}
+
+/// Force a disk rescan and refresh the short cache. Used by apply / write paths.
+fn scan_snapshot_fresh(home: &Path) -> Snapshot {
+    scan_snapshot_with_cache(home, false)
+}
+
+fn scan_snapshot_with_cache(home: &Path, allow_cache: bool) -> Snapshot {
+    let fingerprint = home_scan_fingerprint(home);
+    if allow_cache {
+        if let Ok(guard) = SNAPSHOT_CACHE.lock() {
+            if let Some(cached) = guard.as_ref() {
+                if cached.home == home
+                    && cached.fingerprint == fingerprint
+                    && cached.captured_at.elapsed() < SNAPSHOT_CACHE_TTL
+                {
+                    return cached.snapshot.clone();
+                }
+            }
+        }
+    }
+    let snapshot = scan_snapshot_uncached(home);
+    if let Ok(mut guard) = SNAPSHOT_CACHE.lock() {
+        *guard = Some(CachedSnapshot {
+            home: home.to_path_buf(),
+            fingerprint,
+            captured_at: Instant::now(),
+            snapshot: snapshot.clone(),
+        });
+    }
+    snapshot
+}
+
+fn invalidate_snapshot_cache() {
+    if let Ok(mut guard) = SNAPSHOT_CACHE.lock() {
+        *guard = None;
+    }
+}
+
+fn scan_snapshot_uncached(home: &Path) -> Snapshot {
     let (
         (threads, thread_source),
         (catalog, catalog_source),
@@ -4027,6 +4182,7 @@ fn cleanup_backups_unlocked_with_policy(
     automatic_limit: usize,
     minimum_automatic: usize,
     capacity_limit_bytes: u64,
+    deep_integrity: bool,
 ) -> Result<BackupCleanupResult, String> {
     let root = ensure_backup_root(home, true)?;
     // Prefer surface-validated list so corrupt/size-mismatch entries are visible.
@@ -4083,6 +4239,13 @@ fn cleanup_backups_unlocked_with_policy(
         .collect::<Vec<_>>();
     let mut healthy = Vec::new();
     for entry in managed {
+        if !deep_integrity {
+            // Startup/maintain prune path: surface validation already ran via
+            // list_backups_at. Full hash / quick_check stays on restore, manual
+            // cleanup, and repair preflight.
+            healthy.push(entry);
+            continue;
+        }
         match validate_backup_integrity(home, Path::new(&entry.path)) {
             Ok(()) => healthy.push(entry),
             Err(error) => {
@@ -4178,6 +4341,23 @@ fn cleanup_backups_unlocked(
         AUTOMATIC_BACKUP_LIMIT,
         MINIMUM_AUTOMATIC_BACKUPS,
         BACKUP_CAPACITY_LIMIT_BYTES,
+        true,
+    )
+}
+
+fn cleanup_backups_unlocked_light(
+    home: &Path,
+    include_legacy: bool,
+    additionally_protected: &[PathBuf],
+) -> Result<BackupCleanupResult, String> {
+    cleanup_backups_unlocked_with_policy(
+        home,
+        include_legacy,
+        additionally_protected,
+        AUTOMATIC_BACKUP_LIMIT,
+        MINIMUM_AUTOMATIC_BACKUPS,
+        BACKUP_CAPACITY_LIMIT_BYTES,
+        false,
     )
 }
 
@@ -4217,7 +4397,9 @@ fn maintain_backups_at(home: &Path) -> Result<Option<BackupCleanupResult>, Strin
     if load_pending_operation(home)?.is_some() {
         return Ok(None);
     }
-    cleanup_backups_unlocked(home, false, &[]).map(Some)
+    // Over-limit / expired-incomplete only: prune with surface checks.
+    // Deep hash integrity remains on manual cleanup, restore, and repair preflight.
+    cleanup_backups_unlocked_light(home, false, &[]).map(Some)
 }
 
 fn estimate_manifest_bytes(home: &Path, rollout_updates: &[RolloutUpdate]) -> Result<u64, String> {
@@ -8142,7 +8324,8 @@ fn repair_projection_selected_at_inner(
             ));
         }
     }
-    let snapshot = scan_snapshot(home);
+    // Apply/dry-run planning always re-reads disk; do not trust the short refresh cache.
+    let snapshot = scan_snapshot_fresh(home);
     if !dry_run && !snapshot.threads_readable {
         return Err("repair unavailable: state_5.sqlite is not readable".into());
     }
@@ -8240,7 +8423,8 @@ fn repair_projection_selected_at_inner(
 
     // Recompute after acquiring the tool-level operation lock. A short SQLite
     // write fence is acquired only for the snapshot and final commit window.
-    let snapshot = scan_snapshot(home);
+    // Force a fresh scan so plan_token checks never reuse a pre-lock cache entry.
+    let snapshot = scan_snapshot_fresh(home);
     if !snapshot.threads_readable {
         return Err("repair aborted: state_5.sqlite changed or became unreadable".into());
     }
@@ -8609,7 +8793,8 @@ fn repair_projection_selected_at_inner(
         0,
         verification_total,
     );
-    let after = scan_snapshot(home);
+    invalidate_snapshot_cache();
+    let after = scan_snapshot_fresh(home);
     let verification = verify_thread_ids(&after, &target_provider, &desired_ids);
     let reconciliation = verify_projection_reconciliation(&after, store.as_ref(), &reconciled);
     let result = if verification.ok && reconciliation.is_ok() {
@@ -10776,6 +10961,30 @@ mod tests {
     }
 
     #[test]
+
+    #[test]
+    fn snapshot_short_cache_reuses_identical_fingerprint() {
+        let home = make_fixture();
+        invalidate_snapshot_cache();
+        let first = scan_snapshot(&home);
+        let second = scan_snapshot(&home);
+        assert_eq!(first.threads.len(), second.threads.len());
+        assert_eq!(first.rollouts.len(), second.rollouts.len());
+        // Fresh scan still works and repopulates the cache.
+        let forced = scan_snapshot_fresh(&home);
+        assert_eq!(forced.threads.len(), first.threads.len());
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn maintain_backups_skips_when_within_limit() {
+        let home = make_fixture();
+        // Empty / under-limit backup root should not run cleanup work.
+        let result = maintain_backups_at(&home).unwrap();
+        assert!(result.is_none());
+        fs::remove_dir_all(home).unwrap();
+    }
+
     fn desktop_refresh_reuses_cohorts_without_building_preview() {
         let home = make_fixture();
         let refresh = refresh_desktop_at(
@@ -11983,7 +12192,7 @@ mod tests {
         let backups = automatic_test_backups(&home, 7);
 
         let cleanup =
-            cleanup_backups_unlocked_with_policy(&home, false, &[], 5, 2, u64::MAX).unwrap();
+            cleanup_backups_unlocked_with_policy(&home, false, &[], 5, 2, u64::MAX, true).unwrap();
         assert_eq!(cleanup.removed_count, 2);
         assert!(!backups[0].exists());
         assert!(!backups[1].exists());
@@ -11991,7 +12200,7 @@ mod tests {
         assert_eq!(backup_summary_at(&home).unwrap().automatic_count, 5);
 
         let repeated =
-            cleanup_backups_unlocked_with_policy(&home, false, &[], 5, 2, u64::MAX).unwrap();
+            cleanup_backups_unlocked_with_policy(&home, false, &[], 5, 2, u64::MAX, true).unwrap();
         assert_eq!(repeated.removed_count, 0);
         fs::remove_dir_all(home).unwrap();
     }
@@ -12004,7 +12213,7 @@ mod tests {
         save_pending_operation(&home, "repair", &backups[1]).unwrap();
 
         let cleanup =
-            cleanup_backups_unlocked_with_policy(&home, false, &[], 5, 2, u64::MAX).unwrap();
+            cleanup_backups_unlocked_with_policy(&home, false, &[], 5, 2, u64::MAX, true).unwrap();
         assert_eq!(cleanup.removed_count, 1);
         assert!(backups[0].exists());
         assert!(backups[1].exists());
@@ -12020,7 +12229,7 @@ mod tests {
         let home = make_fixture();
         let backups = automatic_test_backups(&home, 3);
 
-        let cleanup = cleanup_backups_unlocked_with_policy(&home, false, &[], 5, 2, 1).unwrap();
+        let cleanup = cleanup_backups_unlocked_with_policy(&home, false, &[], 5, 2, 1, true).unwrap();
         assert_eq!(cleanup.removed_count, 1);
         assert!(!backups[0].exists());
         assert!(backups[1].exists());
@@ -12048,12 +12257,12 @@ mod tests {
         .unwrap();
 
         let automatic =
-            cleanup_backups_unlocked_with_policy(&home, false, &[], 5, 2, u64::MAX).unwrap();
+            cleanup_backups_unlocked_with_policy(&home, false, &[], 5, 2, u64::MAX, true).unwrap();
         assert_eq!(automatic.removed_legacy_count, 0);
         assert!(backups[0].exists());
 
         let explicit =
-            cleanup_backups_unlocked_with_policy(&home, true, &[], 5, 2, u64::MAX).unwrap();
+            cleanup_backups_unlocked_with_policy(&home, true, &[], 5, 2, u64::MAX, true).unwrap();
         assert_eq!(explicit.removed_legacy_count, 1);
         assert!(!backups[0].exists());
         fs::remove_dir_all(home).unwrap();
@@ -12066,7 +12275,7 @@ mod tests {
         fs::write(backups[0].join("state_5.sqlite"), b"damaged").unwrap();
 
         let cleanup =
-            cleanup_backups_unlocked_with_policy(&home, false, &[], 5, 2, u64::MAX).unwrap();
+            cleanup_backups_unlocked_with_policy(&home, false, &[], 5, 2, u64::MAX, true).unwrap();
         // 1 damaged removed + 1 healthy pruned to enforce automatic limit of 5.
         assert!(cleanup.removed_count >= 1);
         assert!(!backups[0].exists());
@@ -12092,7 +12301,7 @@ mod tests {
         }
 
         let cleanup =
-            cleanup_backups_unlocked_with_policy(&home, false, &[], 5, 2, u64::MAX).unwrap();
+            cleanup_backups_unlocked_with_policy(&home, false, &[], 5, 2, u64::MAX, true).unwrap();
         assert_eq!(cleanup.removed_count, 4);
         assert!(backups[..4].iter().all(|path| !path.exists()));
         assert!(backups[4].exists());
@@ -12125,7 +12334,7 @@ mod tests {
         assert!(!incomplete_backup_is_expired(entry));
 
         let automatic =
-            cleanup_backups_unlocked_with_policy(&home, false, &[], 5, 2, u64::MAX).unwrap();
+            cleanup_backups_unlocked_with_policy(&home, false, &[], 5, 2, u64::MAX, true).unwrap();
         assert_eq!(automatic.removed_count, 1);
         assert!(!backup.exists());
         fs::remove_dir_all(home).unwrap();
@@ -12147,7 +12356,7 @@ mod tests {
         assert!(!incomplete_backup_is_expired(entry));
 
         let cleanup =
-            cleanup_backups_unlocked_with_policy(&home, false, &[], 5, 2, u64::MAX).unwrap();
+            cleanup_backups_unlocked_with_policy(&home, false, &[], 5, 2, u64::MAX, true).unwrap();
         assert_eq!(cleanup.removed_count, 1);
         assert!(!backup.exists());
         fs::remove_dir_all(home).unwrap();
@@ -12160,7 +12369,7 @@ mod tests {
         fs::write(backups[2].join("state_5.sqlite"), b"damaged").unwrap();
 
         let cleanup =
-            cleanup_backups_unlocked_with_policy(&home, false, &[], 5, 2, u64::MAX).unwrap();
+            cleanup_backups_unlocked_with_policy(&home, false, &[], 5, 2, u64::MAX, true).unwrap();
         assert_eq!(cleanup.removed_count, 1);
         assert!(!backups[2].exists());
         assert_eq!(latest_backup(&home).as_deref(), Some(backups[1].as_path()));
@@ -12201,7 +12410,7 @@ mod tests {
         assert_eq!(incompatible_entry.status, "corrupt");
         assert!(!incompatible_entry.restorable);
 
-        let cleanup = cleanup_backups_unlocked_with_policy(&home, false, &[], 5, 2, 1).unwrap();
+        let cleanup = cleanup_backups_unlocked_with_policy(&home, false, &[], 5, 2, 1, true).unwrap();
         // Damaged newest is deleted; keep at least two healthy points despite capacity=1.
         assert!(cleanup.removed_count >= 1);
         assert!(!newest.exists());

@@ -653,16 +653,16 @@ export default function App() {
     }
   }, [addLog, restartPath])
 
-  const toggleSession = (id: string) => {
+  const toggleSession = useCallback((id: string) => {
     setSelectedIds(current => {
       const next = new Set(current)
       if (next.has(id)) next.delete(id)
       else next.add(id)
       return next
     })
-  }
+  }, [])
 
-  const toggleGroupSelection = (group: SessionGroup) => {
+  const toggleGroupSelection = useCallback((group: SessionGroup) => {
     setSelectedIds(current => {
       const next = new Set(current)
       const allSelected = group.sessions.every(session => next.has(session.id))
@@ -672,9 +672,9 @@ export default function App() {
       }
       return next
     })
-  }
+  }, [])
 
-  const toggleGroupOpen = (key: string) => {
+  const toggleGroupOpen = useCallback((key: string) => {
     startTransition(() => {
       setExpandedGroups(current => {
         const next = new Set(current)
@@ -683,9 +683,9 @@ export default function App() {
         return next
       })
     })
-  }
+  }, [])
 
-  const openProjectFolder = async (group: SessionGroup) => {
+  const openProjectFolder = useCallback(async (group: SessionGroup) => {
     try {
       await call<string>('open_project_folder', { path: group.path })
       setToast(`已打开项目文件夹：${group.name}`)
@@ -694,9 +694,9 @@ export default function App() {
       setToast(`无法打开项目文件夹：${message}`)
       addLog('warn', `打开项目文件夹失败：${group.path}，${message}`)
     }
-  }
+  }, [addLog])
 
-  const copySessionId = async (session: LocalSession) => {
+  const copySessionId = useCallback(async (session: LocalSession) => {
     try {
       await copyText(session.id)
       setToast('已复制完整会话 ID')
@@ -705,9 +705,9 @@ export default function App() {
       setToast(`复制会话 ID 失败：${message}`)
       addLog('warn', `复制会话 ID 失败：${session.id}，${message}`)
     }
-  }
+  }, [addLog])
 
-  const revealRollout = async (session: LocalSession) => {
+  const revealRollout = useCallback(async (session: LocalSession) => {
     if (!session.rolloutPath) return
     try {
       await call<string>('reveal_rollout_file', { path: session.rolloutPath })
@@ -717,7 +717,7 @@ export default function App() {
       setToast(`无法定位 rollout JSONL：${message}`)
       addLog('warn', `定位 rollout JSONL 失败：${session.rolloutPath}，${message}`)
     }
-  }
+  }, [addLog])
 
   const openRepository = async () => {
     try {
@@ -837,9 +837,9 @@ export default function App() {
               onToggleGroupOpen={toggleGroupOpen}
               onToggleGroupSelection={toggleGroupSelection}
               onToggleSession={toggleSession}
-              onOpenProject={group => void openProjectFolder(group)}
-              onCopySessionId={session => void copySessionId(session)}
-              onRevealRollout={session => void revealRollout(session)}
+              onOpenProject={openProjectFolder}
+              onCopySessionId={copySessionId}
+              onRevealRollout={revealRollout}
             />
           )}
 

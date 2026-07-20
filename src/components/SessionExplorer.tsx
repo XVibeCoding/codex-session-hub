@@ -74,9 +74,9 @@ function SessionStatus({ session }: { session: LocalSession }) {
 type SessionRowProps = {
   session: LocalSession
   selected: boolean
-  onToggle: () => void
-  onCopyId: () => void
-  onRevealRollout: () => void
+  onToggle: (id: string) => void
+  onCopyId: (session: LocalSession) => void
+  onRevealRollout: (session: LocalSession) => void
 }
 
 const SessionRow = memo(function SessionRow({
@@ -88,14 +88,23 @@ const SessionRow = memo(function SessionRow({
 }: SessionRowProps) {
   return (
     <div className={`session-row${selected ? ' selected' : ''}`}>
-      <MixedCheckbox checked={selected} label={`选择会话 ${session.title}`} onChange={onToggle} />
+      <MixedCheckbox
+        checked={selected}
+        label={`选择会话 ${session.title}`}
+        onChange={() => onToggle(session.id)}
+      />
       <div className="session-main">
         <div className="session-copy">
           <strong title={session.title}>{session.title}</strong>
           <span title={session.id}>会话 ID：{compactSessionId(session.id)}</span>
         </div>
         <div className="session-actions">
-          <button type="button" title="复制完整会话 ID" aria-label={`复制会话 ID ${session.id}`} onClick={onCopyId}>
+          <button
+            type="button"
+            title="复制完整会话 ID"
+            aria-label={`复制会话 ID ${session.id}`}
+            onClick={() => onCopyId(session)}
+          >
             <Copy size={15} />
           </button>
           <button
@@ -103,7 +112,7 @@ const SessionRow = memo(function SessionRow({
             title={session.rolloutPath ? '在文件管理器中定位 rollout JSONL' : '未找到 rollout JSONL'}
             aria-label={`定位会话 ${session.title} 的 rollout JSONL`}
             disabled={!session.rolloutPath}
-            onClick={onRevealRollout}
+            onClick={() => onRevealRollout(session)}
           >
             <FileJson size={16} />
           </button>
@@ -122,10 +131,10 @@ type ProjectGroupProps = {
   group: SessionGroup
   open: boolean
   selectedIds: Set<string>
-  onToggleOpen: () => void
-  onToggleGroup: () => void
+  onToggleOpen: (key: string) => void
+  onToggleGroup: (group: SessionGroup) => void
   onToggleSession: (id: string) => void
-  onOpenProject: () => void
+  onOpenProject: (group: SessionGroup) => void
   onCopySessionId: (session: LocalSession) => void
   onRevealRollout: (session: LocalSession) => void
 }
@@ -154,14 +163,14 @@ const ProjectGroup = memo(function ProjectGroup({
           checked={allSelected}
           mixed={selectedCount > 0 && !allSelected}
           label={`选择项目 ${group.name} 的全部会话`}
-          onChange={onToggleGroup}
+          onChange={() => onToggleGroup(group)}
         />
         <button
           className="project-chevron"
           type="button"
           aria-expanded={open}
           aria-label={`${open ? '收起' : '展开'}项目 ${group.name}`}
-          onClick={onToggleOpen}
+          onClick={() => onToggleOpen(group.key)}
         >
           {open ? <ChevronDown size={17} /> : <ChevronRight size={17} />}
         </button>
@@ -170,7 +179,7 @@ const ProjectGroup = memo(function ProjectGroup({
           type="button"
           title={`在文件管理器中打开：${group.path}`}
           aria-label={`打开项目文件夹 ${group.name}`}
-          onClick={onOpenProject}
+          onClick={() => onOpenProject(group)}
         >
           <FolderOpen size={18} />
         </button>
@@ -179,7 +188,7 @@ const ProjectGroup = memo(function ProjectGroup({
           type="button"
           title={group.path}
           aria-expanded={open}
-          onClick={onToggleOpen}
+          onClick={() => onToggleOpen(group.key)}
         >
           <strong>{group.name}</strong>
         </button>
@@ -193,9 +202,9 @@ const ProjectGroup = memo(function ProjectGroup({
               key={session.id}
               session={session}
               selected={selectedIds.has(session.id)}
-              onToggle={() => onToggleSession(session.id)}
-              onCopyId={() => onCopySessionId(session)}
-              onRevealRollout={() => onRevealRollout(session)}
+              onToggle={onToggleSession}
+              onCopyId={onCopySessionId}
+              onRevealRollout={onRevealRollout}
             />
           ))}
         </div>
@@ -247,10 +256,10 @@ export function SessionExplorer({
           group={group}
           open={forceOpen || expandedGroups.has(group.key)}
           selectedIds={selectedIds}
-          onToggleOpen={() => onToggleGroupOpen(group.key)}
-          onToggleGroup={() => onToggleGroupSelection(group)}
+          onToggleOpen={onToggleGroupOpen}
+          onToggleGroup={onToggleGroupSelection}
           onToggleSession={onToggleSession}
-          onOpenProject={() => onOpenProject(group)}
+          onOpenProject={onOpenProject}
           onCopySessionId={onCopySessionId}
           onRevealRollout={onRevealRollout}
         />
