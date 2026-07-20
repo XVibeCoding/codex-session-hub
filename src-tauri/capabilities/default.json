@@ -11,10 +11,10 @@
       "identifier": "opener:allow-open-url",
       "allow": [
         {
-          "url": "https://github.com/XVibeCoding/codex-provider-hub"
+          "url": "https://github.com/XVibeCoding/codex-session-hub"
         },
         {
-          "url": "https://github.com/XVibeCoding/codex-provider-hub/releases"
+          "url": "https://github.com/XVibeCoding/codex-session-hub/releases"
         }
       ]
     }

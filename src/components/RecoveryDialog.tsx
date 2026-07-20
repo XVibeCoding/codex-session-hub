@@ -86,7 +86,7 @@ function RecoveryProgressBar({ phase, progress }: { phase: RecoveryPhase; progre
       <div
         className="progress-track"
         role="progressbar"
-        aria-label="会话恢复进度"
+        aria-label="会话修复进度"
         aria-valuemin={0}
         aria-valuemax={100}
         aria-valuenow={percent ?? undefined}

@@ -1610,7 +1610,7 @@ mod tests {
                 .unwrap()
                 .as_nanos();
             let path = std::env::temp_dir().join(format!(
-                "codex-provider-hub-rollout-test-{}-{timestamp}-{nonce}",
+                "codex-session-hub-rollout-test-{}-{timestamp}-{nonce}",
                 std::process::id()
             ));
             fs::create_dir_all(path.join("sessions/2026/07/13")).unwrap();

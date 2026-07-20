@@ -292,6 +292,16 @@ export default function App() {
     void refreshDesktop(true).catch(() => undefined)
   }, [])
 
+  // Background update probe so the header can badge without opening the dialog.
+  // Delayed slightly so it does not contend with the first desktop scan.
+  useEffect(() => {
+    if (!isTauriDesktop()) return
+    const timer = window.setTimeout(() => {
+      void updater.checkForUpdates({ silent: true })
+    }, 2500)
+    return () => window.clearTimeout(timer)
+  }, [updater.checkForUpdates])
+
   useEffect(() => {
     if (!technicalOpen || backups) return
     void refreshBackups()
@@ -734,7 +744,7 @@ export default function App() {
       <main className="desktop-required">
         <span><ShieldCheck size={28} /></span>
         <h1>请打开桌面应用</h1>
-        <p>Codex 会话恢复只在已安装的 EXE 桌面端运行。浏览器页面不会读取或修改本地会话。</p>
+        <p>Codex 会话工具只在已安装的 EXE 桌面端运行。浏览器页面不会读取或修改本地会话。</p>
       </main>
     )
   }
@@ -745,8 +755,8 @@ export default function App() {
         <div className="brand-lockup">
           <span className="brand-mark"><Sparkles size={19} /></span>
           <span className="brand-copy">
-            <span className="brand-title"><strong>Codex 会话恢复</strong><button type="button" onClick={() => setUpdateOpen(true)} disabled={recoveryBusy}>v{appVersion ?? '...'}</button></span>
-            <small>本地会话可见性修复</small>
+            <span className="brand-title"><strong>Codex 会话工具</strong><button type="button" className={updater.status === 'available' ? 'version-has-update' : undefined} onClick={() => setUpdateOpen(true)} disabled={recoveryBusy} title={updater.status === 'available' && updater.latestVersion ? `有可用更新 v${updater.latestVersion}` : '查看应用版本与更新'}>v{appVersion ?? '...'}{updater.status === 'available' ? <span className="update-dot" aria-hidden="true" /> : null}</button></span>
+            <small>本地会话可见性与备份工具</small>
           </span>
         </div>
         <div className="header-actions">
@@ -762,8 +772,8 @@ export default function App() {
           <button className="icon-button" type="button" title="打开项目仓库" aria-label="打开项目仓库" onClick={() => void openRepository()}>
             <Github size={17} />
           </button>
-          <button className="secondary-button compact-button update-button" type="button" onClick={() => setUpdateOpen(true)} disabled={recoveryBusy}>
-            <Download size={16} />版本更新
+          <button className={`secondary-button compact-button update-button${updater.status === 'available' ? ' has-update' : ''}`} type="button" onClick={() => setUpdateOpen(true)} disabled={recoveryBusy} title={updater.status === 'available' && updater.latestVersion ? `发现新版本 v${updater.latestVersion}` : '检查应用更新'}>
+            <Download size={16} />{updater.status === 'available' && updater.latestVersion ? `更新 v${updater.latestVersion}` : '版本更新'}
           </button>
           <button className="icon-button" type="button" title="重新扫描" aria-label="重新扫描" onClick={() => void refreshDesktop(false).catch(() => undefined)} disabled={scanning}>
             <RefreshCw className={scanning ? 'spin' : ''} size={17} />
@@ -899,6 +909,7 @@ export default function App() {
         releaseNotes={updater.releaseNotes}
         progress={updater.progress}
         error={updater.error}
+        lastCheckedAt={updater.lastCheckedAt}
         onClose={() => setUpdateOpen(false)}
         onCheck={() => void updater.checkForUpdates()}
         onInstall={() => void updater.installUpdate()}

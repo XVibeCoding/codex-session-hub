@@ -4,5 +4,5 @@
 )]
 
 fn main() {
-    codex_provider_hub_lib::run()
+    codex_session_hub_lib::run()
 }

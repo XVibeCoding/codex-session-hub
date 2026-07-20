@@ -321,7 +321,7 @@ mod imp {
         let local_app_data = std::env::var_os("LOCALAPPDATA")
             .ok_or_else(|| "LOCALAPPDATA is not available".to_string())?;
         Ok(PathBuf::from(local_app_data)
-            .join("Codex Provider Hub")
+            .join("Codex Session Hub")
             .join("locks")
             .join(format!("{}.lck", home_hash(home))))
     }
@@ -355,7 +355,7 @@ mod imp {
         let mut overlapped = lock_overlapped();
         try_lock_file(&file, &mut overlapped).map_err(|error| {
             if lock_violation(&error) {
-                "another Provider Hub operation is already active".to_string()
+                "another Session Hub operation is already active".to_string()
             } else {
                 format!("cannot acquire operation lock: {error}")
             }
@@ -690,7 +690,7 @@ mod imp {
                 || process.ApplicationType == RmCritical
                 || process.ApplicationType == RmExplorer;
             let close_reason = if is_current || same_executable {
-                "Provider Hub processes are never closed"
+                "Session Hub processes are never closed"
             } else if is_ancestor {
                 "ancestor processes are protected"
             } else if protected_type {
@@ -1003,7 +1003,7 @@ mod imp {
                         && error.code() == HRESULT::from_win32(ERROR_ACCESS_DENIED.0)
                     {
                         format!(
-                            "access denied while preparing to terminate PID {}; only restart Provider Hub as administrator if that process is elevated",
+                            "access denied while preparing to terminate PID {}; only restart Session Hub as administrator if that process is elevated",
                             process.pid
                         )
                     } else {

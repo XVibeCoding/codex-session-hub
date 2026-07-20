@@ -59,7 +59,40 @@ button:disabled { cursor: not-allowed; opacity: .48; }
 .secondary-button:hover:not(:disabled) { border-color: #a9beb5; background: #f6faf8; }
 .primary-button:active:not(:disabled), .secondary-button:active:not(:disabled) { transform: translateY(1px); }
 .compact-button { min-height: 40px; padding-inline: 13px; font-size: 14px; }
-.update-button { min-width: 112px; }
+.update-button { min-width: 112px; position: relative; }
+.update-button.has-update { color: #0f5c45; border-color: #8fc9b4; background: #eef8f3; }
+.brand-title > button { position: relative; }
+.brand-title > button.version-has-update { color: #0f5c45; }
+.update-dot {
+  position: absolute;
+  top: 2px;
+  right: 2px;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: #d94841;
+  box-shadow: 0 0 0 2px #fff;
+}
+.update-hint {
+  max-width: 460px !important;
+  margin-top: 10px !important;
+  font-size: 12.5px !important;
+  line-height: 1.5 !important;
+  color: #6a7d76 !important;
+}
+.update-hint code {
+  font-family: Consolas, "SFMono-Regular", monospace;
+  font-size: 12px;
+  color: #315e52;
+}
+.update-manifest-hint {
+  margin: 0;
+  padding: 0 18px 12px;
+  color: #8a9a94;
+  font-size: 11px;
+  text-align: right;
+}
+
 .text-button { min-height: 36px; display: inline-flex; align-items: center; gap: 6px; padding: 6px 4px; border: 0; color: var(--muted); background: transparent; cursor: pointer; font-size: 13px; }
 .text-button:hover:not(:disabled) { color: var(--accent-strong); }
 .text-button.danger { color: var(--danger); }

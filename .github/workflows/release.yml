@@ -37,7 +37,7 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
         with:
           tagName: v__VERSION__
-          releaseName: Codex Provider Hub v__VERSION__
+          releaseName: Codex 会话工具 v__VERSION__
           releaseBody: Windows NSIS and MSI installers with signed in-app updater artifacts.
           releaseDraft: true
           prerelease: false

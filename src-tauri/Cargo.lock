@@ -489,8 +489,8 @@ dependencies = [
 ]
 
 [[package]]
-name = "codex-provider-hub"
-version = "0.1.3"
+name = "codex-session-hub"
+version = "0.1.4"
 dependencies = [
  "chrono",
  "fs2",

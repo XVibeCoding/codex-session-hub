@@ -1151,7 +1151,7 @@ fn open_sqlite_light(path: &Path) -> Result<SnapshotConnection, String> {
 }
 
 fn open_sqlite_safe_snapshot(path: &Path) -> Result<SnapshotConnection, String> {
-    let snapshot_root = std::env::temp_dir().join("codex-provider-hub-readonly");
+    let snapshot_root = std::env::temp_dir().join("codex-session-hub-readonly");
     fs::create_dir_all(&snapshot_root).map_err(|error| error.to_string())?;
     SNAPSHOT_CLEANUP.call_once(|| {
         let Ok(entries) = fs::read_dir(&snapshot_root) else {
@@ -8877,7 +8877,7 @@ pub fn run_cli() -> i32 {
     let mut args = std::env::args().skip(1).collect::<Vec<_>>();
     if args.is_empty() || args.iter().any(|arg| arg == "--help" || arg == "-h") {
         println!(
-            "codex-provider-hub scan|backup|repair|verify|restore [BACKUP] \
+            "codex-session-hub scan|backup|repair|verify|restore [BACKUP] \
              [--codex-home PATH] [--target-provider ID] \
              [--dry-run|--apply] [--plan-token TOKEN]\n\
              repair defaults to all sessions in dry-run mode; --apply requires the latest preview token"
@@ -8996,7 +8996,7 @@ mod tests {
             .as_nanos();
         let sequence = FIXTURE_COUNTER.fetch_add(1, Ordering::Relaxed);
         std::env::temp_dir().join(format!(
-            "provider-hub-core-{}-{nonce}-{sequence}",
+            "session-hub-core-{}-{nonce}-{sequence}",
             std::process::id()
         ))
     }
