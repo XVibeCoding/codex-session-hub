@@ -160,7 +160,7 @@ Primary goal: keep repair safety, make list refresh cheap.
 
 ### 5. Field-trimmed list scan
 
-- [ ] Light scan omits repair-only heavy fields (at least `first_user_message` when not needed for list status)
+- [ ] Light scan omits repair-only heavy fields (at least `first_user_message` when not needed for list status) — **deferred**: shared `scan_snapshot` feeds list + plan/verify; field still required for visibility_mismatch post-write checks
 - [ ] Repair / preview-for-apply path still loads fields required for `state_insert_from_rollout` and plan building
 - [ ] Avoid dual-source inconsistency: same thread id should not show contradictory status between light list and repair scan beyond known timing races
 - [ ] Main files: `src-tauri/src/core.rs`
@@ -168,7 +168,7 @@ Primary goal: keep repair safety, make list refresh cheap.
 
 ### 6. Fix expensive scan analytics
 
-- [ ] `provider_drift` nested `local_rows.iter().find` replaced with `HashMap` / index by `thread_id` (`O(n)`)
+- [x] `provider_drift` nested `local_rows.iter().find` replaced with `HashMap` / index by `thread_id` (`O(n)`)
 - [ ] Remove redundant `HashSet` rebuilds in `scan_result_for_snapshot` where safe and readable
 - [ ] Prefer implementing **after** shared context (task 3) so analytics run once on shared inputs
 - [ ] Main files: `src-tauri/src/core.rs`
@@ -176,7 +176,7 @@ Primary goal: keep repair safety, make list refresh cheap.
 
 ### 7. Rollout scan structure / IO
 
-- [ ] Avoid unnecessary `PrimaryRollout` clones in `read_rollouts` (move into `primary_rollouts`)
+- [x] Avoid unnecessary `PrimaryRollout` clones in `read_rollouts` (move into `primary_rollouts`)
 - [ ] Reduce duplicated parallel maps where practical without hurting call sites
 - [ ] Optional: bounded parallel jsonl primary parsing (document pool limit; preserve deterministic issue ordering in tests)
 - [ ] Do not expand enrichment caps without reason (`MAX_ENRICHMENT_*` already bounded)

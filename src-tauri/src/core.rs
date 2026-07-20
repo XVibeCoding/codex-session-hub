@@ -1643,8 +1643,9 @@ fn read_rollouts(home: &Path) -> RolloutRead {
     let mut valid_active_ids = HashSet::new();
     let mut valid_archived_ids = HashSet::new();
     let mut files = Vec::with_capacity(inventory.rollouts.len());
+    // Move PrimaryRollout into primary_rollouts; only clone fields needed by
+    // parallel lookup maps (avoid full-struct clone of message/preview/git).
     for (id, primary) in inventory.rollouts {
-        primary_rollouts.insert(id.clone(), primary.clone());
         rollouts.insert(id.clone());
         rollout_paths.insert(id.clone(), primary.path.clone());
         files.push(primary.path.clone());
@@ -1653,22 +1654,26 @@ fn read_rollouts(home: &Path) -> RolloutRead {
         } else {
             valid_active_ids.insert(id.clone());
         }
-        if let Some(source) = primary.source.clone() {
-            rollout_sources.insert(id.clone(), source);
+        if let Some(source) = primary.source.as_ref() {
+            rollout_sources.insert(id.clone(), source.clone());
         }
-        if let Some(thread_source) = primary.thread_source.clone() {
-            rollout_thread_sources.insert(id.clone(), thread_source);
+        if let Some(thread_source) = primary.thread_source.as_ref() {
+            rollout_thread_sources.insert(id.clone(), thread_source.clone());
         }
-        if let Some(cwd) = primary.cwd.clone() {
-            rollout_cwds.insert(id.clone(), cwd);
+        if let Some(cwd) = primary.cwd.as_ref() {
+            rollout_cwds.insert(id.clone(), cwd.clone());
         }
         rollout_locality.insert(id.clone(), primary.locality.clone());
-        if let Some(raw_provider) = primary.model_provider.clone() {
-            if let Ok(provider) = validate_provider(&raw_provider) {
-                rollout_provider_values.insert(id.clone(), raw_provider);
-                rollout_providers.entry(id).or_default().insert(provider);
+        if let Some(raw_provider) = primary.model_provider.as_ref() {
+            if let Ok(provider) = validate_provider(raw_provider) {
+                rollout_provider_values.insert(id.clone(), raw_provider.clone());
+                rollout_providers
+                    .entry(id.clone())
+                    .or_default()
+                    .insert(provider);
             }
         }
+        primary_rollouts.insert(id, primary);
     }
     let mut issues = HashMap::new();
     for issue in inventory.issues {
@@ -7610,9 +7615,17 @@ fn scan_result_for_snapshot_with_cohorts(
                 })
         })
         .count();
+    // O(n) index: avoid nested find over local catalog rows per thread.
+    let mut local_row_by_thread: HashMap<&str, &CatalogRow> =
+        HashMap::with_capacity(local_rows.len());
+    for row in &local_rows {
+        local_row_by_thread
+            .entry(row.thread_id.as_str())
+            .or_insert(*row);
+    }
     let mut provider_drift_ids = HashSet::new();
     for thread in &snapshot.threads {
-        if let Some(row) = local_rows.iter().find(|row| row.thread_id == thread.id) {
+        if let Some(row) = local_row_by_thread.get(thread.id.as_str()) {
             if cohorts.recoverable_ids.contains(&thread.id)
                 && !row.missing_candidate
                 && thread.provider != row.provider
